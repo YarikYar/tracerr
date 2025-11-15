@@ -25,6 +25,7 @@ type TransactionInfo struct {
 type BalanceTracker struct {
 	transactions []*TransactionInfo
 	totalChange  *big.Int
+	totalFees    *big.Int
 }
 
 func main() {
@@ -100,6 +101,7 @@ func main() {
 	tracker := &BalanceTracker{
 		transactions: make([]*TransactionInfo, 0),
 		totalChange:  big.NewInt(0),
+		totalFees:    big.NewInt(0),
 	}
 
 	err = traceTransactionChain(ctx, api, initialTx, addr, tracker, 0, *scanDepth)
@@ -150,6 +152,8 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 
 	if isOriginalSender {
 		fmt.Printf("%s  Fees (paid by sender): %s nanoTON\n", indent, fees.String())
+		// Track total fees paid by original sender
+		tracker.totalFees.Add(tracker.totalFees, fees)
 	} else {
 		fmt.Printf("%s  Fees (paid by %s): %s nanoTON\n", indent, txAddr.String(), fees.String())
 	}
@@ -403,12 +407,23 @@ func printResults(tracker *BalanceTracker, sender *address.Address) {
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Total transactions traced: %d\n", len(tracker.transactions))
 	fmt.Printf("Original sender: %s\n", sender.String())
-	fmt.Printf("\nTotal balance change: %s nanoTON\n", tracker.totalChange.String())
 
-	// Convert to TON
+	// Fees paid by sender
+	fmt.Printf("\nTotal fees paid by sender: %s nanoTON\n", tracker.totalFees.String())
+	feesTon := new(big.Float).SetInt(tracker.totalFees)
+	feesTon.Quo(feesTon, big.NewFloat(1e9))
+	fmt.Printf("Total fees paid by sender: %s TON\n", feesTon.String())
+
+	// Balance change
+	fmt.Printf("\nTotal balance change: %s nanoTON\n", tracker.totalChange.String())
 	tonAmount := new(big.Float).SetInt(tracker.totalChange)
 	tonAmount.Quo(tonAmount, big.NewFloat(1e9))
 	fmt.Printf("Total balance change: %s TON\n", tonAmount.String())
+
+	// Net result (should include fees already)
+	fmt.Printf("\n--- Analysis ---\n")
+	fmt.Printf("Fees are included in balance change\n")
+	fmt.Printf("Balance change = incoming - outgoing - fees\n")
 
 	fmt.Println("\nTransaction details:")
 	for i, tx := range tracker.transactions {
