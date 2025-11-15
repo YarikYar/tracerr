@@ -18,6 +18,7 @@ import (
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/ton/dns"
 )
 
 type TransactionInfo struct {
@@ -64,9 +65,29 @@ func logTrace(format string, args ...interface{}) {
 func resolveAddress(ctx context.Context, api ton.APIClientWrapped, addrStr string) (*address.Address, error) {
 	// Check if it's a .ton domain
 	if strings.HasSuffix(strings.ToLower(addrStr), ".ton") || strings.HasSuffix(strings.ToLower(addrStr), ".t.me") {
-		// TODO: Implement TON DNS resolution
-		// For now, DNS domains are not supported - user needs to provide raw address
-		return nil, fmt.Errorf("TON DNS domains (.ton, .t.me) are not yet supported. Please use the raw address instead")
+		fmt.Printf("Resolving TON DNS: %s...\n", addrStr)
+
+		// Get root DNS contract address
+		root, err := dns.GetRootContractAddr(ctx, api)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get DNS root: %w", err)
+		}
+
+		// Create DNS resolver
+		resolver := dns.NewDNSClient(api, root)
+		domain, err := resolver.Resolve(ctx, strings.ToLower(addrStr))
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve DNS: %w", err)
+		}
+
+		// Get wallet record
+		walletAddr := domain.GetWalletRecord()
+		if walletAddr == nil {
+			return nil, fmt.Errorf("no wallet record found for domain: %s", addrStr)
+		}
+
+		fmt.Printf("✓ Resolved to: %s\n", walletAddr.String())
+		return walletAddr, nil
 	}
 
 	// Regular address parsing
@@ -121,7 +142,23 @@ func main() {
 	if *txHash == "" || *txLT == 0 {
 		fmt.Printf("\nFetching recent %d transactions for address: %s\n\n", *recentCount, addr.String())
 
-		txs, err := api.ListTransactions(ctx, addr, uint32(*recentCount), 0, nil)
+		// Get account state first to get LastTxLT and LastTxHash
+		master, err := api.CurrentMasterchainInfo(ctx)
+		if err != nil {
+			log.Fatalf("Failed to get master block: %v", err)
+		}
+
+		account, err := api.GetAccount(ctx, master, addr)
+		if err != nil {
+			log.Fatalf("Failed to get account: %v", err)
+		}
+
+		if account == nil || !account.IsActive {
+			log.Fatal("Account is not active or does not exist")
+		}
+
+		// Use LastTxLT and LastTxHash from account state
+		txs, err := api.ListTransactions(ctx, addr, uint32(*recentCount), account.LastTxLT, account.LastTxHash)
 		if err != nil {
 			log.Fatalf("Failed to get transactions: %v", err)
 		}
