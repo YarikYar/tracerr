@@ -1,0 +1,241 @@
+basePath: /
+definitions:
+  models.AccountInfo:
+    properties:
+      address:
+        example: EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf
+        type: string
+      balance_change_ton:
+        example: "-0.115324419"
+        type: string
+      network_fees_ton:
+        example: "0.005692355"
+        type: string
+    type: object
+  models.ErrorResponse:
+    properties:
+      error:
+        example: Invalid address format
+        type: string
+      success:
+        example: false
+        type: boolean
+    type: object
+  models.HealthResponse:
+    properties:
+      status:
+        example: healthy
+        type: string
+      version:
+        example: 1.0.0
+        type: string
+    type: object
+  models.RecentTransactionsRequest:
+    properties:
+      address:
+        example: EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf
+        type: string
+      count:
+        example: 10
+        type: integer
+    required:
+    - address
+    type: object
+  models.RecentTransactionsResponse:
+    properties:
+      address:
+        example: EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf
+        type: string
+      success:
+        example: true
+        type: boolean
+      transactions:
+        items:
+          $ref: '#/definitions/models.TransactionItem'
+        type: array
+    type: object
+  models.ResolveRequest:
+    properties:
+      domain:
+        example: foundation.ton
+        type: string
+    required:
+    - domain
+    type: object
+  models.ResolveResponse:
+    properties:
+      address:
+        example: EQAU_6rW5f5P3eZCANkI2zCgIJl6PqDLuHVs2LmNaLfSXwIa
+        type: string
+      domain:
+        example: foundation.ton
+        type: string
+      success:
+        example: true
+        type: boolean
+    type: object
+  models.TraceRequest:
+    properties:
+      address:
+        example: EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf
+        type: string
+      hash:
+        example: 0a1073ddaae99eed5a6de55cbd60aee18b1fc3deeee59414024679bf00172229
+        type: string
+      lt:
+        example: 63633416000001
+        type: integer
+      scan_depth:
+        example: 1000
+        type: integer
+    required:
+    - address
+    type: object
+  models.TraceResponse:
+    properties:
+      accounts:
+        items:
+          $ref: '#/definitions/models.AccountInfo'
+        type: array
+      original_sender:
+        example: EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf
+        type: string
+      success:
+        example: true
+        type: boolean
+      total_transactions:
+        example: 9
+        type: integer
+    type: object
+  models.TransactionItem:
+    properties:
+      amount:
+        example: "0.05"
+        type: string
+      hash:
+        example: 0a1073ddaae99eed5a6de55cbd60aee18b1fc3deeee59414024679bf00172229
+        type: string
+      lt:
+        example: 63633416000001
+        type: integer
+      timestamp:
+        example: 1699876543
+        type: integer
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: support@example.com
+    name: API Support
+  description: API for tracing TON blockchain transactions and analyzing balance flows
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  title: TON Transaction Tracer API
+  version: "1.0"
+paths:
+  /api/v1/dns/resolve:
+    post:
+      consumes:
+      - application/json
+      description: Resolve a .ton or .t.me domain to wallet address
+      parameters:
+      - description: Resolve request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.ResolveRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.ResolveResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+      summary: Resolve TON DNS domain
+      tags:
+      - dns
+  /api/v1/trace:
+    post:
+      consumes:
+      - application/json
+      description: Trace a transaction chain and return balance changes for all involved
+        accounts
+      parameters:
+      - description: Trace request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.TraceRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.TraceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+      summary: Trace a TON transaction
+      tags:
+      - transactions
+  /api/v1/transactions/recent:
+    post:
+      consumes:
+      - application/json
+      description: Get recent transactions for an address
+      parameters:
+      - description: Recent transactions request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.RecentTransactionsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.RecentTransactionsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+      summary: Get recent transactions
+      tags:
+      - transactions
+  /health:
+    get:
+      description: Check if the service is healthy
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.HealthResponse'
+      summary: Health check
+      tags:
+      - health
+swagger: "2.0"
