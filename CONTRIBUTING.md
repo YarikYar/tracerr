@@ -82,7 +82,7 @@ Enhancement suggestions are tracked as GitHub issues. When suggesting an enhance
 
 ```bash
 # Fork and clone the repository
-git clone https://github.com/yourusername/tracerr.git
+git clone https://github.com/YarikYar/tracerr.git
 cd tracerr
 
 # Install dependencies
