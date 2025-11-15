@@ -22,10 +22,16 @@ type TransactionInfo struct {
 	Amount  *big.Int
 }
 
+type AccountStats struct {
+	Address       string
+	BalanceChange *big.Int
+	Fees          *big.Int
+}
+
 type BalanceTracker struct {
-	transactions []*TransactionInfo
-	totalChange  *big.Int
-	totalFees    *big.Int
+	transactions  []*TransactionInfo
+	accountStats  map[string]*AccountStats // Map of address -> stats
+	originalAddr  string
 }
 
 var quietMode bool
@@ -109,20 +115,20 @@ func main() {
 	// Trace the transaction chain
 	tracker := &BalanceTracker{
 		transactions: make([]*TransactionInfo, 0),
-		totalChange:  big.NewInt(0),
-		totalFees:    big.NewInt(0),
+		accountStats: make(map[string]*AccountStats),
+		originalAddr: addr.String(),
 	}
 
-	err = traceTransactionChain(ctx, api, initialTx, addr, tracker, 0, *scanDepth)
+	err = traceTransactionChain(ctx, api, initialTx, tracker, 0, *scanDepth)
 	if err != nil {
 		log.Fatalf("Failed to trace transaction chain: %v", err)
 	}
 
 	// Print results
-	printResults(tracker, addr)
+	printResults(tracker)
 }
 
-func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, originalSender *address.Address, tracker *BalanceTracker, depth int, scanDepth int) error {
+func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, tracker *BalanceTracker, depth int, scanDepth int) error {
 	if depth > 50 {
 		fmt.Println("Max depth reached, stopping trace")
 		return nil
@@ -150,29 +156,45 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	}
 	logTrace("%s  LT: %d\n", indent, tx.LT)
 
-	// Display fees for this transaction
-	fees := tx.TotalFees.Coins.Nano()
+	// Calculate total fees (transaction fees + forward fees from outgoing messages)
+	totalFees := new(big.Int).Set(tx.TotalFees.Coins.Nano())
 
-	// Check if this is the original sender's account
-	// Compare using Equals() to handle bounceable/non-bounceable address forms
-	isOriginalSender := false
-	if txAddr != nil {
-		isOriginalSender = txAddr.Equals(originalSender)
+	// Add forward fees from outgoing messages
+	if tx.IO.Out != nil {
+		outList, err := tx.IO.Out.ToSlice()
+		if err == nil {
+			for _, msg := range outList {
+				if msg.MsgType == tlb.MsgTypeInternal {
+					intMsg := msg.AsInternal()
+					totalFees.Add(totalFees, intMsg.FwdFee.Nano())
+					totalFees.Add(totalFees, intMsg.IHRFee.Nano())
+				}
+			}
+		}
 	}
 
-	if isOriginalSender {
-		logTrace("%s  Fees (paid by sender): %s nanoTON\n", indent, fees.String())
-		// Track total fees paid by original sender
-		tracker.totalFees.Add(tracker.totalFees, fees)
-	} else {
-		logTrace("%s  Fees (paid by %s): %s nanoTON\n", indent, txAddr.String(), fees.String())
-	}
+	logTrace("%s  Fees: %s nanoTON\n", indent, totalFees.String())
 
 	// Calculate balance change for this transaction
-	balanceChange := calculateBalanceChange(tx, originalSender)
+	balanceChange := calculateBalanceChange(tx)
 	if balanceChange.Cmp(big.NewInt(0)) != 0 {
-		tracker.totalChange.Add(tracker.totalChange, balanceChange)
-		logTrace("%s  Balance Change for sender: %s nanoTON\n", indent, balanceChange.String())
+		logTrace("%s  Balance Change: %s nanoTON\n", indent, balanceChange.String())
+	}
+
+	// Track stats for this account
+	if txAddr != nil {
+		addrStr := txAddr.String()
+		stats, exists := tracker.accountStats[addrStr]
+		if !exists {
+			stats = &AccountStats{
+				Address:       addrStr,
+				BalanceChange: big.NewInt(0),
+				Fees:          big.NewInt(0),
+			}
+			tracker.accountStats[addrStr] = stats
+		}
+		stats.BalanceChange.Add(stats.BalanceChange, balanceChange)
+		stats.Fees.Add(stats.Fees, totalFees)
 	}
 
 	// Track this transaction
@@ -243,7 +265,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 						logTrace("%s      -> Matched by CreatedLT %d + SrcAddr (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
-						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
+						err = traceTransactionChain(ctx, api, destTx, tracker, depth+1, scanDepth)
 						if err != nil {
 							return err
 						}
@@ -254,7 +276,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 						logTrace("%s      -> Matched by CreatedLT %d only (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
-						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
+						err = traceTransactionChain(ctx, api, destTx, tracker, depth+1, scanDepth)
 						if err != nil {
 							return err
 						}
@@ -333,7 +355,7 @@ func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr
 	return allTxs
 }
 
-func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *big.Int {
+func calculateBalanceChange(tx *tlb.Transaction) *big.Int {
 	change := big.NewInt(0)
 
 	// Convert transaction address to comparable format
@@ -342,105 +364,93 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 	}
 
 	txAddr := address.NewAddress(0, 0, tx.AccountAddr)
-	targetAddrStr := targetAddr.String()
 
-	// Check if this transaction is ON the target account
-	// Use Equals() to handle bounceable/non-bounceable forms
-	isTargetAccount := txAddr.Equals(targetAddr)
+	// This transaction happened on this account
+	// Incoming amount (positive)
+	incomingAmount := big.NewInt(0)
+	if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+		inMsg := tx.IO.In.AsInternal()
+		incomingAmount = inMsg.Amount.Nano()
+		change.Add(change, incomingAmount)
+	}
 
-	if isTargetAccount {
-		// This transaction happened on the target's account
-		// Incoming amount (positive)
-		incomingAmount := big.NewInt(0)
-		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
-			inMsg := tx.IO.In.AsInternal()
-			incomingAmount = inMsg.Amount.Nano()
-			change.Add(change, incomingAmount)
-		}
-
-		// Outgoing amounts (negative)
-		outgoingAmount := big.NewInt(0)
-		if tx.IO.Out != nil {
-			outList, err := tx.IO.Out.ToSlice()
-			if err == nil {
-				for _, msg := range outList {
-					if msg.MsgType == tlb.MsgTypeInternal {
-						intMsg := msg.AsInternal()
-						change.Sub(change, intMsg.Amount.Nano())
-						outgoingAmount.Add(outgoingAmount, intMsg.Amount.Nano())
-					}
+	// Outgoing amounts (negative)
+	outgoingAmount := big.NewInt(0)
+	if tx.IO.Out != nil {
+		outList, err := tx.IO.Out.ToSlice()
+		if err == nil {
+			for _, msg := range outList {
+				if msg.MsgType == tlb.MsgTypeInternal {
+					intMsg := msg.AsInternal()
+					change.Sub(change, intMsg.Amount.Nano())
+					outgoingAmount.Add(outgoingAmount, intMsg.Amount.Nano())
 				}
 			}
 		}
+	}
 
-		// Transaction fees (negative)
-		feesAmount := tx.TotalFees.Coins.Nano()
-		change.Sub(change, feesAmount)
+	// NOTE: Fees are NOT included in balance change
+	// They are tracked separately in AccountStats
+	feesAmount := tx.TotalFees.Coins.Nano()
 
-		// Debug logging
+	// Debug logging
+	if len(txAddr.String()) >= 8 {
 		log.Printf("Balance calc for %s: incoming=%s, outgoing=%s, fees=%s, net=%s",
-			targetAddrStr[:8], incomingAmount.String(), outgoingAmount.String(), feesAmount.String(), change.String())
-	} else {
-		// This transaction is on a different account, but check if target is involved
-
-		// Check if target is receiving money in this transaction
-		if tx.IO.Out != nil {
-			outList, err := tx.IO.Out.ToSlice()
-			if err == nil {
-				for _, msg := range outList {
-					if msg.MsgType == tlb.MsgTypeInternal {
-						intMsg := msg.AsInternal()
-						if intMsg.DstAddr != nil && intMsg.DstAddr.Equals(targetAddr) {
-							// Target is receiving money (positive)
-							change.Add(change, intMsg.Amount.Nano())
-						}
-					}
-				}
-			}
-		}
-
-		// Check if target sent this transaction (source of incoming message)
-		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
-			inMsg := tx.IO.In.AsInternal()
-			if inMsg.SrcAddr != nil && inMsg.SrcAddr.Equals(targetAddr) {
-				// This transaction was triggered by target's outgoing message
-				// (already counted in target's transaction, so don't double count)
-			}
-		}
+			txAddr.String()[:8], incomingAmount.String(), outgoingAmount.String(), feesAmount.String(), change.String())
 	}
 
 	return change
 }
 
-func printResults(tracker *BalanceTracker, sender *address.Address) {
+func printResults(tracker *BalanceTracker) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("TRACE SUMMARY")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Total transactions traced: %d\n", len(tracker.transactions))
-	fmt.Printf("Original sender: %s\n", sender.String())
+	fmt.Printf("Original sender: %s\n\n", tracker.originalAddr)
 
-	// Fees paid by sender
-	fmt.Printf("\nTotal fees paid by sender: %s nanoTON\n", tracker.totalFees.String())
-	feesTon := new(big.Float).SetInt(tracker.totalFees)
-	feesTon.Quo(feesTon, big.NewFloat(1e9))
-	fmt.Printf("Total fees paid by sender: %s TON\n", feesTon.String())
+	// Display stats for each account
+	fmt.Println("Account Balance Changes & Network Fees:")
+	fmt.Println(strings.Repeat("-", 60))
 
-	// Balance change
-	fmt.Printf("\nTotal balance change: %s nanoTON\n", tracker.totalChange.String())
-	tonAmount := new(big.Float).SetInt(tracker.totalChange)
-	tonAmount.Quo(tonAmount, big.NewFloat(1e9))
-	fmt.Printf("Total balance change: %s TON\n", tonAmount.String())
+	// Sort accounts to show original sender first
+	var accounts []string
+	for addr := range tracker.accountStats {
+		accounts = append(accounts, addr)
+	}
 
-	// Net result (should include fees already)
-	fmt.Printf("\n--- Analysis ---\n")
-	fmt.Printf("Fees are included in balance change\n")
-	fmt.Printf("Balance change = incoming - outgoing - fees\n")
-
-	fmt.Println("\nTransaction details:")
-	for i, tx := range tracker.transactions {
-		if tx.Amount.Cmp(big.NewInt(0)) != 0 {
-			fmt.Printf("  [%d] %s: %s nanoTON\n", i+1, tx.Address, tx.Amount.String())
+	// Move original sender to front
+	for i, addr := range accounts {
+		if addr == tracker.originalAddr {
+			accounts[0], accounts[i] = accounts[i], accounts[0]
+			break
 		}
 	}
-	fmt.Println(strings.Repeat("=", 60))
+
+	for _, addr := range accounts {
+		stats := tracker.accountStats[addr]
+
+		// Balance change INCLUDING fees (like TONViewer shows)
+		balanceWithFees := new(big.Int).Set(stats.BalanceChange)
+		balanceWithFees.Sub(balanceWithFees, stats.Fees)
+
+		// Convert to TON
+		balanceTon := new(big.Float).SetInt(balanceWithFees)
+		balanceTon.Quo(balanceTon, big.NewFloat(1e9))
+
+		feesTon := new(big.Float).SetInt(stats.Fees)
+		feesTon.Quo(feesTon, big.NewFloat(1e9))
+
+		// Mark original sender
+		marker := ""
+		if addr == tracker.originalAddr {
+			marker = " [ORIGINAL]"
+		}
+
+		fmt.Printf("\nAccount: %s%s\n", addr, marker)
+		fmt.Printf("  Balance Change: %s TON\n", balanceTon.Text('f', 9))
+		fmt.Printf("  Network Fees:   %s TON\n", feesTon.Text('f', 9))
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 60))
 }
