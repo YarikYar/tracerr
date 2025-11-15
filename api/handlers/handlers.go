@@ -3,10 +3,12 @@ package handlers
 import (
 	"context"
 	"encoding/hex"
+	"log"
 	"math/big"
 	"net/http"
 
 	"ton-tracer/api/models"
+	"ton-tracer/pkg/database"
 	"ton-tracer/pkg/tracer"
 
 	"github.com/gin-gonic/gin"
@@ -18,9 +20,10 @@ import (
 type Handler struct {
 	client *liteclient.ConnectionPool
 	api    ton.APIClientWrapped
+	repo   *database.Repository
 }
 
-func NewHandler(testnet bool) (*Handler, error) {
+func NewHandler(testnet bool, repo *database.Repository) (*Handler, error) {
 	client := liteclient.NewConnectionPool()
 
 	configURL := "https://ton.org/global.config.json"
@@ -39,12 +42,13 @@ func NewHandler(testnet bool) (*Handler, error) {
 	return &Handler{
 		client: client,
 		api:    api,
+		repo:   repo,
 	}, nil
 }
 
 // TraceTransaction godoc
 // @Summary Trace a TON transaction
-// @Description Trace a transaction chain and return balance changes for all involved accounts
+// @Description Trace a transaction chain and return balance changes for all involved accounts. Uses database cache for performance.
 // @Tags transactions
 // @Accept json
 // @Produce json
@@ -79,6 +83,52 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 	if scanDepth == 0 {
 		scanDepth = 100
 	}
+
+	// Create cache key
+	cacheKey := &database.TraceCacheKey{
+		Address:   addr.String(),
+		ScanDepth: scanDepth,
+	}
+
+	if req.Hash != "" {
+		cacheKey.Hash = &req.Hash
+	}
+
+	if req.LT != 0 {
+		cacheKey.LT = &req.LT
+	}
+
+	// Check cache first
+	if h.repo != nil {
+		cached, err := h.repo.FindCachedTrace(cacheKey)
+		if err != nil {
+			log.Printf("Cache lookup error: %v", err)
+			// Continue with normal flow on cache error
+		} else if cached != nil {
+			log.Printf("Cache hit for address %s", addr.String())
+
+			// Return cached result
+			accounts := make([]models.AccountInfo, 0, len(cached.Accounts))
+			for _, acc := range cached.Accounts {
+				accounts = append(accounts, models.AccountInfo{
+					Address:       acc.Address,
+					BalanceChange: acc.BalanceChangeTON,
+					NetworkFees:   acc.NetworkFeesTON,
+				})
+			}
+
+			c.JSON(http.StatusOK, models.TraceResponse{
+				Success:           cached.Success,
+				OriginalSender:    cached.OriginalSender,
+				TotalTransactions: cached.TotalTransactions,
+				Accounts:          accounts,
+				Cached:            true,
+			})
+			return
+		}
+	}
+
+	log.Printf("Cache miss for address %s, performing blockchain scan", addr.String())
 
 	var initialTx *tlb.Transaction
 
@@ -157,6 +207,13 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		}
 
 		initialTx = txs[0]
+
+		// Update cache key with actual hash and LT
+		if len(initialTx.Hash) > 0 {
+			hashStr := hex.EncodeToString(initialTx.Hash)
+			cacheKey.Hash = &hashStr
+		}
+		cacheKey.LT = &initialTx.LT
 	}
 
 	// Trace transaction
@@ -168,6 +225,15 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 
 	tracker, err := tracer.TraceTransaction(ctx, h.api, initialTx, config)
 	if err != nil {
+		// Save error to cache
+		if h.repo != nil {
+			errMsg := err.Error()
+			saveErr := h.repo.SaveTraceResult(cacheKey, false, &errMsg, "", 0, nil)
+			if saveErr != nil {
+				log.Printf("Failed to cache error: %v", saveErr)
+			}
+		}
+
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Success: false,
 			Error:   "Failed to trace transaction: " + err.Error(),
@@ -177,6 +243,8 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 
 	// Build response
 	accounts := make([]models.AccountInfo, 0, len(tracker.AccountStats))
+	cachedAccounts := make([]database.CachedAccountResult, 0, len(tracker.AccountStats))
+
 	for _, stats := range tracker.AccountStats {
 		balanceWithFees := new(big.Int).Set(stats.BalanceChange)
 		balanceWithFees.Sub(balanceWithFees, stats.Fees)
@@ -187,11 +255,37 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		feesTon := new(big.Float).SetInt(stats.Fees)
 		feesTon.Quo(feesTon, big.NewFloat(1e9))
 
+		balanceStr := balanceTon.Text('f', 9)
+		feesStr := feesTon.Text('f', 9)
+
 		accounts = append(accounts, models.AccountInfo{
 			Address:       stats.Address,
-			BalanceChange: balanceTon.Text('f', 9),
-			NetworkFees:   feesTon.Text('f', 9),
+			BalanceChange: balanceStr,
+			NetworkFees:   feesStr,
 		})
+
+		cachedAccounts = append(cachedAccounts, database.CachedAccountResult{
+			Address:          stats.Address,
+			BalanceChangeTON: balanceStr,
+			NetworkFeesTON:   feesStr,
+		})
+	}
+
+	// Save to cache
+	if h.repo != nil {
+		err := h.repo.SaveTraceResult(
+			cacheKey,
+			true,
+			nil,
+			tracker.OriginalAddr,
+			len(tracker.Transactions),
+			cachedAccounts,
+		)
+		if err != nil {
+			log.Printf("Failed to cache result: %v", err)
+		} else {
+			log.Printf("Saved trace result to cache for address %s", addr.String())
+		}
 	}
 
 	c.JSON(http.StatusOK, models.TraceResponse{
@@ -199,6 +293,7 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		OriginalSender:    tracker.OriginalAddr,
 		TotalTransactions: len(tracker.Transactions),
 		Accounts:          accounts,
+		Cached:            false,
 	})
 }
 
@@ -337,6 +432,38 @@ func (h *Handler) GetRecentTransactions(c *gin.Context) {
 	})
 }
 
+// GetCacheStats godoc
+// @Summary Get cache statistics
+// @Description Get statistics about the database cache
+// @Tags cache
+// @Produce json
+// @Success 200 {object} models.CacheStatsResponse
+// @Failure 500 {object} models.ErrorResponse
+// @Router /api/v1/cache/stats [get]
+func (h *Handler) GetCacheStats(c *gin.Context) {
+	if h.repo == nil {
+		c.JSON(http.StatusServiceUnavailable, models.ErrorResponse{
+			Success: false,
+			Error:   "Database not configured",
+		})
+		return
+	}
+
+	stats, err := h.repo.GetCacheStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Success: false,
+			Error:   "Failed to get cache stats: " + err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, models.CacheStatsResponse{
+		Success: true,
+		Stats:   stats,
+	})
+}
+
 // HealthCheck godoc
 // @Summary Health check
 // @Description Check if the service is healthy
@@ -347,6 +474,6 @@ func (h *Handler) GetRecentTransactions(c *gin.Context) {
 func (h *Handler) HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, models.HealthResponse{
 		Status:  "healthy",
-		Version: "1.0.0",
+		Version: "1.0.0-with-db",
 	})
 }

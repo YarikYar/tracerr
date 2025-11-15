@@ -1,35 +1,86 @@
 version: '3.8'
 
 services:
+  # PostgreSQL database for caching
+  postgres:
+    image: postgres:16-alpine
+    container_name: ton-tracer-postgres
+    environment:
+      - POSTGRES_USER=tontracer
+      - POSTGRES_PASSWORD=tontracer
+      - POSTGRES_DB=tontracer
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./pkg/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tontracer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - internal
+
+  # TON Tracer API with database cache
   ton-tracer-api:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - API_HOST=${API_HOST:-tracer.zaruchevskiy.ru}
     container_name: ton-tracer-api
-    ports:
-      - "8080:8080"
     environment:
       - GIN_MODE=release
+      - API_HOST=${API_HOST:-tracer.zaruchevskiy.ru}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=tontracer
+      - DB_PASSWORD=tontracer
+      - DB_NAME=tontracer
+      - DB_SSLMODE=disable
     command: ["-port", "8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
+    networks:
+      - internal
+      - traefik_default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ton-tracer.rule=Host(`${API_HOST:-tracer.zaruchevskiy.ru}`)"
+      - "traefik.http.routers.ton-tracer.entrypoints=websecure"
+      - "traefik.http.routers.ton-tracer.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ton-tracer.loadbalancer.server.port=8080"
+      - "traefik.docker.network=traefik_default"
 
   # Optional: Testnet version
   ton-tracer-api-testnet:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - API_HOST=${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}
     container_name: ton-tracer-api-testnet
-    ports:
-      - "8081:8080"
     environment:
       - GIN_MODE=release
+      - API_HOST=${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=tontracer
+      - DB_PASSWORD=tontracer
+      - DB_NAME=tontracer
+      - DB_SSLMODE=disable
     command: ["-port", "8080", "-testnet"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     profiles: ["testnet"]  # Only starts when specified
     healthcheck:
@@ -37,4 +88,24 @@ services:
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
+    networks:
+      - internal
+      - traefik_default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ton-tracer-testnet.rule=Host(`${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}`)"
+      - "traefik.http.routers.ton-tracer-testnet.entrypoints=websecure"
+      - "traefik.http.routers.ton-tracer-testnet.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ton-tracer-testnet.loadbalancer.server.port=8080"
+      - "traefik.docker.network=traefik_default"
+
+networks:
+  internal:
+    driver: bridge
+  traefik_default:
+    external: true
+
+volumes:
+  postgres_data:
+    driver: local

@@ -21,6 +21,7 @@ type TraceResponse struct {
 	OriginalSender    string        `json:"original_sender" example:"EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf"`
 	TotalTransactions int           `json:"total_transactions" example:"9"`
 	Accounts          []AccountInfo `json:"accounts"`
+	Cached            bool          `json:"cached" example:"false"`
 }
 
 // ErrorResponse represents an error response
@@ -66,4 +67,10 @@ type RecentTransactionsResponse struct {
 	Success      bool              `json:"success" example:"true"`
 	Address      string            `json:"address" example:"EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf"`
 	Transactions []TransactionItem `json:"transactions"`
+}
+
+// CacheStatsResponse represents cache statistics
+type CacheStatsResponse struct {
+	Success bool                   `json:"success" example:"true"`
+	Stats   map[string]interface{} `json:"stats"`
 }

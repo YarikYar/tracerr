@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git
@@ -10,11 +10,21 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
+# Install swag for generating Swagger docs
+RUN go install github.com/swaggo/swag/cmd/swag@latest
+
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ton-tracer-api ./cmd/api
+# Make build script executable
+RUN chmod +x scripts/build.sh
+
+# Build argument for API host
+ARG API_HOST=tracer.zaruchevskiy.ru
+ENV API_HOST=${API_HOST}
+
+# Run build script (updates host, generates swagger, builds binary)
+RUN scripts/build.sh
 
 # Final stage
 FROM alpine:latest
