@@ -27,7 +27,7 @@ TON Transaction Tracer helps you understand complex transaction chains on the TO
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/tracerr.git
+git clone https://github.com/YarikYar/tracerr.git
 cd tracerr
 
 # Build the CLI tool
@@ -108,7 +108,7 @@ Full-featured REST API for integrating transaction tracing into your application
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/tracerr.git
+git clone https://github.com/YarikYar/tracerr.git
 cd tracerr
 
 # Build CLI tool
@@ -421,8 +421,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/tracerr/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/tracerr/discussions)
+- **Issues**: [GitHub Issues](https://github.com/YarikYar/tracerr/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/YarikYar/tracerr/discussions)
 - **TON Dev Chat**: [Telegram](https://t.me/tondev)
 
 ## Links
