@@ -265,33 +265,62 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 	}
 
 	txAddr := address.NewAddress(0, 0, tx.AccountAddr)
+	targetAddrStr := targetAddr.String()
 
-	// Only calculate for the target address
-	if txAddr.String() != targetAddr.String() {
-		return change
-	}
+	// Check if this transaction is ON the target account
+	isTargetAccount := txAddr.String() == targetAddrStr
 
-	// Incoming amount
-	if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
-		inMsg := tx.IO.In.AsInternal()
-		change.Add(change, inMsg.Amount.Nano())
-	}
+	if isTargetAccount {
+		// This transaction happened on the target's account
+		// Incoming amount (positive)
+		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+			inMsg := tx.IO.In.AsInternal()
+			change.Add(change, inMsg.Amount.Nano())
+		}
 
-	// Outgoing amounts
-	if tx.IO.Out != nil {
-		outList, err := tx.IO.Out.ToSlice()
-		if err == nil {
-			for _, msg := range outList {
-				if msg.MsgType == tlb.MsgTypeInternal {
-					intMsg := msg.AsInternal()
-					change.Sub(change, intMsg.Amount.Nano())
+		// Outgoing amounts (negative)
+		if tx.IO.Out != nil {
+			outList, err := tx.IO.Out.ToSlice()
+			if err == nil {
+				for _, msg := range outList {
+					if msg.MsgType == tlb.MsgTypeInternal {
+						intMsg := msg.AsInternal()
+						change.Sub(change, intMsg.Amount.Nano())
+					}
 				}
 			}
 		}
-	}
 
-	// Transaction fees
-	change.Sub(change, tx.TotalFees.Coins.Nano())
+		// Transaction fees (negative)
+		change.Sub(change, tx.TotalFees.Coins.Nano())
+	} else {
+		// This transaction is on a different account, but check if target is involved
+
+		// Check if target is receiving money in this transaction
+		if tx.IO.Out != nil {
+			outList, err := tx.IO.Out.ToSlice()
+			if err == nil {
+				for _, msg := range outList {
+					if msg.MsgType == tlb.MsgTypeInternal {
+						intMsg := msg.AsInternal()
+						if intMsg.DstAddr != nil && intMsg.DstAddr.String() == targetAddrStr {
+							// Target is receiving money (positive)
+							change.Add(change, intMsg.Amount.Nano())
+						}
+					}
+				}
+			}
+		}
+
+		// Check if target sent this transaction (source of incoming message)
+		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+			inMsg := tx.IO.In.AsInternal()
+			if inMsg.SrcAddr != nil && inMsg.SrcAddr.String() == targetAddrStr {
+				// This transaction was triggered by target's outgoing message
+				// (already counted in target's transaction, so don't double count)
+			}
+		}
+	}
 
 	return change
 }
