@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/big"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -34,6 +39,20 @@ type BalanceTracker struct {
 	originalAddr  string
 }
 
+// JSON export structures
+type JSONAccountStats struct {
+	Address       string `json:"address"`
+	BalanceChange string `json:"balance_change_ton"`
+	Fees          string `json:"network_fees_ton"`
+}
+
+type JSONExport struct {
+	Timestamp        string              `json:"timestamp"`
+	OriginalSender   string              `json:"original_sender"`
+	TotalTransactions int                `json:"total_transactions"`
+	Accounts         []JSONAccountStats  `json:"accounts"`
+}
+
 var quietMode bool
 
 func logTrace(format string, args ...interface{}) {
@@ -42,24 +61,31 @@ func logTrace(format string, args ...interface{}) {
 	}
 }
 
+func resolveAddress(ctx context.Context, api ton.APIClientWrapped, addrStr string) (*address.Address, error) {
+	// Check if it's a .ton domain
+	if strings.HasSuffix(strings.ToLower(addrStr), ".ton") || strings.HasSuffix(strings.ToLower(addrStr), ".t.me") {
+		// TODO: Implement TON DNS resolution
+		// For now, DNS domains are not supported - user needs to provide raw address
+		return nil, fmt.Errorf("TON DNS domains (.ton, .t.me) are not yet supported. Please use the raw address instead")
+	}
+
+	// Regular address parsing
+	return address.ParseAddr(addrStr)
+}
+
 func main() {
-	txHash := flag.String("hash", "", "Transaction hash to trace (base64 or hex)")
-	txAddr := flag.String("addr", "", "Transaction address")
-	txLT := flag.Uint64("lt", 0, "Transaction logical time")
+	txHash := flag.String("hash", "", "Transaction hash to trace (base64 or hex) - optional if you want to select from recent txs")
+	txAddr := flag.String("addr", "", "Transaction address (required)")
+	txLT := flag.Uint64("lt", 0, "Transaction logical time - optional if you want to select from recent txs")
 	scanDepth := flag.Int("scan-depth", 100, "Number of transactions to scan per account (default 100)")
+	recentCount := flag.Int("recent", 10, "Number of recent transactions to show for selection (default 10)")
+	testnet := flag.Bool("testnet", false, "Use testnet instead of mainnet")
+	exportJSON := flag.String("export", "", "Export results to JSON file (e.g., output.json)")
 	flag.BoolVar(&quietMode, "quiet", false, "Quiet mode: only show final summary")
 	flag.Parse()
 
-	if *txHash == "" {
-		log.Fatal("Please provide transaction hash using -hash flag")
-	}
-
 	if *txAddr == "" {
 		log.Fatal("Please provide transaction address using -addr flag")
-	}
-
-	if *txLT == 0 {
-		log.Fatal("Please provide transaction logical time using -lt flag")
 	}
 
 	ctx := context.Background()
@@ -67,49 +93,123 @@ func main() {
 	// Connect to TON liteserver
 	client := liteclient.NewConnectionPool()
 
+	// Select config based on network
+	configURL := "https://ton.org/global.config.json"
+	if *testnet {
+		configURL = "https://ton.org/testnet-global.config.json"
+		fmt.Println("Using TESTNET")
+	}
+
 	// Connect to public liteservers
-	err := client.AddConnectionsFromConfigUrl(ctx, "https://ton.org/global.config.json")
+	err := client.AddConnectionsFromConfigUrl(ctx, configURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to liteservers: %v", err)
 	}
 
 	api := ton.NewAPIClient(client, ton.ProofCheckPolicySecure).WithRetry()
 
-	// Parse address
-	addr, err := address.ParseAddr(*txAddr)
+	// Parse address (support both regular addresses and .ton domains)
+	addr, err := resolveAddress(ctx, api, *txAddr)
 	if err != nil {
-		log.Fatalf("Failed to parse address: %v", err)
+		log.Fatalf("Failed to parse/resolve address: %v", err)
 	}
+	fmt.Printf("Using address: %s\n", addr.String())
 
-	logTrace("Tracing transaction: %s\n", *txHash)
-	logTrace("Address: %s\n", addr.String())
-	logTrace("LT: %d\n\n", *txLT)
+	var initialTx *tlb.Transaction
 
-	txHashBytes, err := hex.DecodeString(*txHash)
-	if err != nil {
-		log.Fatalf("Failed to decode transaction hash: %v", err)
-	}
+	// If hash and LT are not provided, show recent transactions for selection
+	if *txHash == "" || *txLT == 0 {
+		fmt.Printf("\nFetching recent %d transactions for address: %s\n\n", *recentCount, addr.String())
 
-	// Get the initial transaction
-	txs, err := api.ListTransactions(ctx, addr, 1, *txLT, txHashBytes)
-	if err != nil {
-		log.Fatalf("Failed to get transaction: %v", err)
-	}
-
-	if len(txs) == 0 {
-		log.Fatal("Transaction not found")
-	}
-
-	initialTx := txs[0]
-
-	// Verify hash matches
-	if len(initialTx.Hash) > 0 {
-		actualHash := hex.EncodeToString(initialTx.Hash)
-		if actualHash != *txHash {
-			log.Printf("Warning: Transaction hash mismatch. Expected: %s, Got: %s", *txHash, actualHash)
+		txs, err := api.ListTransactions(ctx, addr, uint32(*recentCount), 0, nil)
+		if err != nil {
+			log.Fatalf("Failed to get transactions: %v", err)
 		}
+
+		if len(txs) == 0 {
+			log.Fatal("No transactions found for this address")
+		}
+
+		// Display transactions
+		fmt.Println("Recent transactions:")
+		fmt.Println(strings.Repeat("-", 80))
+		for i, tx := range txs {
+			txHashStr := "N/A"
+			if len(tx.Hash) > 0 {
+				txHashStr = hex.EncodeToString(tx.Hash)[:16] + "..."
+			}
+
+			timestamp := time.Unix(int64(tx.Now), 0).Format("2006-01-02 15:04:05")
+
+			// Get amount info
+			amountInfo := "N/A"
+			if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+				inMsg := tx.IO.In.AsInternal()
+				tonAmount := new(big.Float).SetInt(inMsg.Amount.Nano())
+				tonAmount.Quo(tonAmount, big.NewFloat(1e9))
+				amountInfo = fmt.Sprintf("+%s TON", tonAmount.Text('f', 6))
+			}
+
+			fmt.Printf("[%2d] Hash: %s | LT: %d | Time: %s | %s\n",
+				i+1, txHashStr, tx.LT, timestamp, amountInfo)
+		}
+		fmt.Println(strings.Repeat("-", 80))
+
+		// Get user selection
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print("\nSelect transaction number (1-", len(txs), ") or 'q' to quit: ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "q" || input == "Q" {
+			fmt.Println("Exiting...")
+			os.Exit(0)
+		}
+
+		selection, err := strconv.Atoi(input)
+		if err != nil || selection < 1 || selection > len(txs) {
+			log.Fatalf("Invalid selection: %s", input)
+		}
+
+		initialTx = txs[selection-1]
+		*txLT = initialTx.LT
+		if len(initialTx.Hash) > 0 {
+			*txHash = hex.EncodeToString(initialTx.Hash)
+		}
+
+		fmt.Printf("\nSelected transaction: %s (LT: %d)\n\n", *txHash, *txLT)
 	} else {
-		log.Printf("Warning: Transaction hash is not available")
+		// Original behavior: use provided hash and LT
+		logTrace("Tracing transaction: %s\n", *txHash)
+		logTrace("Address: %s\n", addr.String())
+		logTrace("LT: %d\n\n", *txLT)
+
+		txHashBytes, err := hex.DecodeString(*txHash)
+		if err != nil {
+			log.Fatalf("Failed to decode transaction hash: %v", err)
+		}
+
+		// Get the initial transaction
+		txs, err := api.ListTransactions(ctx, addr, 1, *txLT, txHashBytes)
+		if err != nil {
+			log.Fatalf("Failed to get transaction: %v", err)
+		}
+
+		if len(txs) == 0 {
+			log.Fatal("Transaction not found")
+		}
+
+		initialTx = txs[0]
+
+		// Verify hash matches
+		if len(initialTx.Hash) > 0 {
+			actualHash := hex.EncodeToString(initialTx.Hash)
+			if actualHash != *txHash {
+				log.Printf("Warning: Transaction hash mismatch. Expected: %s, Got: %s", *txHash, actualHash)
+			}
+		} else {
+			log.Printf("Warning: Transaction hash is not available")
+		}
 	}
 
 	// Trace the transaction chain
@@ -126,6 +226,15 @@ func main() {
 
 	// Print results
 	printResults(tracker)
+
+	// Export to JSON if requested
+	if *exportJSON != "" {
+		err := exportToJSON(tracker, *exportJSON)
+		if err != nil {
+			log.Fatalf("Failed to export to JSON: %v", err)
+		}
+		fmt.Printf("\n✓ Results exported to: %s\n", *exportJSON)
+	}
 }
 
 func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, tracker *BalanceTracker, depth int, scanDepth int) error {
@@ -453,4 +562,46 @@ func printResults(tracker *BalanceTracker) {
 	}
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
+}
+
+func exportToJSON(tracker *BalanceTracker, filename string) error {
+	var accounts []JSONAccountStats
+
+	for addr, stats := range tracker.accountStats {
+		// Balance change INCLUDING fees (like TONViewer shows)
+		balanceWithFees := new(big.Int).Set(stats.BalanceChange)
+		balanceWithFees.Sub(balanceWithFees, stats.Fees)
+
+		// Convert to TON
+		balanceTon := new(big.Float).SetInt(balanceWithFees)
+		balanceTon.Quo(balanceTon, big.NewFloat(1e9))
+
+		feesTon := new(big.Float).SetInt(stats.Fees)
+		feesTon.Quo(feesTon, big.NewFloat(1e9))
+
+		accounts = append(accounts, JSONAccountStats{
+			Address:       addr,
+			BalanceChange: balanceTon.Text('f', 9),
+			Fees:          feesTon.Text('f', 9),
+		})
+	}
+
+	export := JSONExport{
+		Timestamp:        time.Now().Format(time.RFC3339),
+		OriginalSender:   tracker.originalAddr,
+		TotalTransactions: len(tracker.transactions),
+		Accounts:         accounts,
+	}
+
+	jsonData, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
 }
