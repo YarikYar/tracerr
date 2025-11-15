@@ -31,6 +31,7 @@ func main() {
 	txHash := flag.String("hash", "", "Transaction hash to trace (base64 or hex)")
 	txAddr := flag.String("addr", "", "Transaction address")
 	txLT := flag.Uint64("lt", 0, "Transaction logical time")
+	scanDepth := flag.Int("scan-depth", 100, "Number of transactions to scan per account (default 100)")
 	flag.Parse()
 
 	if *txHash == "" {
@@ -101,7 +102,7 @@ func main() {
 		totalChange:  big.NewInt(0),
 	}
 
-	err = traceTransactionChain(ctx, api, initialTx, addr, tracker, 0)
+	err = traceTransactionChain(ctx, api, initialTx, addr, tracker, 0, *scanDepth)
 	if err != nil {
 		log.Fatalf("Failed to trace transaction chain: %v", err)
 	}
@@ -110,7 +111,7 @@ func main() {
 	printResults(tracker, addr)
 }
 
-func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, originalSender *address.Address, tracker *BalanceTracker, depth int) error {
+func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, originalSender *address.Address, tracker *BalanceTracker, depth int, scanDepth int) error {
 	if depth > 50 {
 		fmt.Println("Max depth reached, stopping trace")
 		return nil
@@ -195,28 +196,15 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 
 			// Get destination account transactions
 			destAddr := intMsg.DstAddr
-			master, _ := api.CurrentMasterchainInfo(ctx)
 
-			// Try to get the account state first to get the latest transaction info
-			var destTxs []*tlb.Transaction
-			account, err := api.GetAccount(ctx, master, destAddr)
-			if err == nil && account != nil && account.IsActive && account.LastTxLT > 0 {
-				// Use account's last transaction as starting point
-				fmt.Printf("%s      Getting transactions from account state (LastLT: %d)...\n", indent, account.LastTxLT)
-				destTxs, err = api.ListTransactions(ctx, destAddr, 100, account.LastTxLT, account.LastTxHash)
+			// Scan transactions with pagination
+			destTxs := scanAccountTransactions(ctx, api, destAddr, scanDepth, indent)
+			if len(destTxs) == 0 {
+				log.Printf("%s      Warning: No transactions found for %s", indent, destAddr.String())
+				continue
 			}
 
-			// Fallback: if account state doesn't work, try with CreatedLT+1
-			if err != nil || destTxs == nil || len(destTxs) == 0 {
-				fmt.Printf("%s      Fallback: trying with CreatedLT+1...\n", indent)
-				destTxs, err = api.ListTransactions(ctx, destAddr, 100, intMsg.CreatedLT+1, nil)
-				if err != nil {
-					log.Printf("%s      Warning: Failed to get transactions for %s: %v", indent, destAddr.String(), err)
-					continue
-				}
-			}
-
-			fmt.Printf("%s      Scanning %d transactions...\n", indent, len(destTxs))
+			fmt.Printf("%s      Scanned %d transactions...\n", indent, len(destTxs))
 
 			// Find the transaction that corresponds to this message
 			found := false
@@ -241,7 +229,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 						fmt.Printf("%s      -> Matched by CreatedLT %d + SrcAddr (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
-						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1)
+						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
 						if err != nil {
 							return err
 						}
@@ -252,7 +240,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 						fmt.Printf("%s      -> Matched by CreatedLT %d only (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
-						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1)
+						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
 						if err != nil {
 							return err
 						}
@@ -269,6 +257,66 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	}
 
 	return nil
+}
+
+func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr *address.Address, limit int, indent string) []*tlb.Transaction {
+	var allTxs []*tlb.Transaction
+
+	// Get account state first
+	master, err := api.CurrentMasterchainInfo(ctx)
+	if err != nil {
+		log.Printf("%s      Warning: Failed to get master block: %v", indent, err)
+		return allTxs
+	}
+
+	account, err := api.GetAccount(ctx, master, addr)
+	if err != nil || account == nil || !account.IsActive || account.LastTxLT == 0 {
+		// Try fallback without account state
+		txs, err := api.ListTransactions(ctx, addr, uint32(limit), 0, nil)
+		if err == nil {
+			return txs
+		}
+		return allTxs
+	}
+
+	fmt.Printf("%s      Paginating from LastLT: %d (target: %d txs)...\n", indent, account.LastTxLT, limit)
+
+	// Paginate through transactions
+	currentLT := account.LastTxLT
+	currentHash := account.LastTxHash
+	batchSize := uint32(15) // ListTransactions limit
+
+	for len(allTxs) < limit {
+		txs, err := api.ListTransactions(ctx, addr, batchSize, currentLT, currentHash)
+		if err != nil {
+			log.Printf("%s      Pagination error at LT %d: %v", indent, currentLT, err)
+			break
+		}
+
+		if len(txs) == 0 {
+			break
+		}
+
+		allTxs = append(allTxs, txs...)
+
+		// Get last transaction for next iteration
+		lastTx := txs[len(txs)-1]
+		if lastTx.LT == 0 {
+			break
+		}
+
+		// Move to next batch
+		currentLT = lastTx.LT
+		currentHash = lastTx.Hash
+
+		// If we got fewer than batch size, we've reached the end
+		if len(txs) < int(batchSize) {
+			break
+		}
+	}
+
+	fmt.Printf("%s      Collected %d transactions total\n", indent, len(allTxs))
+	return allTxs
 }
 
 func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *big.Int {
