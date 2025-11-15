@@ -205,13 +205,36 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 
 			// Find the transaction that corresponds to this message
 			found := false
+			var currentTxAddr *address.Address
+			if len(tx.AccountAddr) > 0 {
+				currentTxAddr = address.NewAddress(0, 0, tx.AccountAddr)
+			}
+
 			for _, destTx := range destTxs {
 				if destTx.IO.In != nil && destTx.IO.In.MsgType == tlb.MsgTypeInternal {
 					inMsg := destTx.IO.In.AsInternal()
 
-					// Match by CreatedLT - this should be unique
-					if inMsg.CreatedLT == intMsg.CreatedLT {
-						fmt.Printf("%s      -> Matched by CreatedLT %d (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
+					// Match by CreatedLT AND source address
+					createdLTMatch := inMsg.CreatedLT == intMsg.CreatedLT
+
+					srcAddrMatch := false
+					if currentTxAddr != nil && inMsg.SrcAddr != nil {
+						srcAddrMatch = inMsg.SrcAddr.String() == currentTxAddr.String()
+					}
+
+					if createdLTMatch && srcAddrMatch {
+						fmt.Printf("%s      -> Matched by CreatedLT %d + SrcAddr (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
+
+						// Recursively trace this transaction
+						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1)
+						if err != nil {
+							return err
+						}
+						found = true
+						break
+					} else if createdLTMatch {
+						// Match by CreatedLT only (less strict)
+						fmt.Printf("%s      -> Matched by CreatedLT %d only (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
 						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1)
