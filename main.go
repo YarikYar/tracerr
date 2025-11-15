@@ -288,12 +288,15 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 	if isTargetAccount {
 		// This transaction happened on the target's account
 		// Incoming amount (positive)
+		incomingAmount := big.NewInt(0)
 		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
 			inMsg := tx.IO.In.AsInternal()
-			change.Add(change, inMsg.Amount.Nano())
+			incomingAmount = inMsg.Amount.Nano()
+			change.Add(change, incomingAmount)
 		}
 
 		// Outgoing amounts (negative)
+		outgoingAmount := big.NewInt(0)
 		if tx.IO.Out != nil {
 			outList, err := tx.IO.Out.ToSlice()
 			if err == nil {
@@ -301,13 +304,19 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 					if msg.MsgType == tlb.MsgTypeInternal {
 						intMsg := msg.AsInternal()
 						change.Sub(change, intMsg.Amount.Nano())
+						outgoingAmount.Add(outgoingAmount, intMsg.Amount.Nano())
 					}
 				}
 			}
 		}
 
 		// Transaction fees (negative)
-		change.Sub(change, tx.TotalFees.Coins.Nano())
+		feesAmount := tx.TotalFees.Coins.Nano()
+		change.Sub(change, feesAmount)
+
+		// Debug logging
+		log.Printf("Balance calc for %s: incoming=%s, outgoing=%s, fees=%s, net=%s",
+			targetAddrStr[:8], incomingAmount.String(), outgoingAmount.String(), feesAmount.String(), change.String())
 	} else {
 		// This transaction is on a different account, but check if target is involved
 
