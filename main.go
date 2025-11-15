@@ -138,11 +138,26 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	}
 	fmt.Printf("%s  LT: %d\n", indent, tx.LT)
 
+	// Display fees for this transaction
+	fees := tx.TotalFees.Coins.Nano()
+
+	// Check if this is the original sender's account
+	isOriginalSender := false
+	if txAddr != nil {
+		isOriginalSender = txAddr.String() == originalSender.String()
+	}
+
+	if isOriginalSender {
+		fmt.Printf("%s  Fees (paid by sender): %s nanoTON\n", indent, fees.String())
+	} else {
+		fmt.Printf("%s  Fees (paid by %s): %s nanoTON\n", indent, txAddr.String(), fees.String())
+	}
+
 	// Calculate balance change for this transaction
 	balanceChange := calculateBalanceChange(tx, originalSender)
 	if balanceChange.Cmp(big.NewInt(0)) != 0 {
 		tracker.totalChange.Add(tracker.totalChange, balanceChange)
-		fmt.Printf("%s  Balance Change: %s nanoTON\n", indent, balanceChange.String())
+		fmt.Printf("%s  Balance Change for sender: %s nanoTON\n", indent, balanceChange.String())
 	}
 
 	// Track this transaction
