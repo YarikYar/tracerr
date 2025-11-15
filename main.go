@@ -28,11 +28,20 @@ type BalanceTracker struct {
 	totalFees    *big.Int
 }
 
+var quietMode bool
+
+func logTrace(format string, args ...interface{}) {
+	if !quietMode {
+		fmt.Printf(format, args...)
+	}
+}
+
 func main() {
 	txHash := flag.String("hash", "", "Transaction hash to trace (base64 or hex)")
 	txAddr := flag.String("addr", "", "Transaction address")
 	txLT := flag.Uint64("lt", 0, "Transaction logical time")
 	scanDepth := flag.Int("scan-depth", 100, "Number of transactions to scan per account (default 100)")
+	flag.BoolVar(&quietMode, "quiet", false, "Quiet mode: only show final summary")
 	flag.Parse()
 
 	if *txHash == "" {
@@ -66,9 +75,9 @@ func main() {
 		log.Fatalf("Failed to parse address: %v", err)
 	}
 
-	fmt.Printf("Tracing transaction: %s\n", *txHash)
-	fmt.Printf("Address: %s\n", addr.String())
-	fmt.Printf("LT: %d\n\n", *txLT)
+	logTrace("Tracing transaction: %s\n", *txHash)
+	logTrace("Address: %s\n", addr.String())
+	logTrace("LT: %d\n\n", *txLT)
 
 	txHashBytes, err := hex.DecodeString(*txHash)
 	if err != nil {
@@ -125,9 +134,9 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	var txHash string
 	if len(tx.Hash) > 0 {
 		txHash = hex.EncodeToString(tx.Hash)
-		fmt.Printf("%sTransaction: %s\n", indent, txHash)
+		logTrace("%sTransaction: %s\n", indent, txHash)
 	} else {
-		fmt.Printf("%sTransaction: <hash unavailable>\n", indent)
+		logTrace("%sTransaction: <hash unavailable>\n", indent)
 		txHash = ""
 	}
 
@@ -135,34 +144,35 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	var txAddr *address.Address
 	if len(tx.AccountAddr) > 0 {
 		txAddr = address.NewAddress(0, 0, tx.AccountAddr)
-		fmt.Printf("%s  Address: %s\n", indent, txAddr.String())
+		logTrace("%s  Address: %s\n", indent, txAddr.String())
 	} else {
-		fmt.Printf("%s  Address: <unavailable>\n", indent)
+		logTrace("%s  Address: <unavailable>\n", indent)
 	}
-	fmt.Printf("%s  LT: %d\n", indent, tx.LT)
+	logTrace("%s  LT: %d\n", indent, tx.LT)
 
 	// Display fees for this transaction
 	fees := tx.TotalFees.Coins.Nano()
 
 	// Check if this is the original sender's account
+	// Compare using Equals() to handle bounceable/non-bounceable address forms
 	isOriginalSender := false
 	if txAddr != nil {
-		isOriginalSender = txAddr.String() == originalSender.String()
+		isOriginalSender = txAddr.Equals(originalSender)
 	}
 
 	if isOriginalSender {
-		fmt.Printf("%s  Fees (paid by sender): %s nanoTON\n", indent, fees.String())
+		logTrace("%s  Fees (paid by sender): %s nanoTON\n", indent, fees.String())
 		// Track total fees paid by original sender
 		tracker.totalFees.Add(tracker.totalFees, fees)
 	} else {
-		fmt.Printf("%s  Fees (paid by %s): %s nanoTON\n", indent, txAddr.String(), fees.String())
+		logTrace("%s  Fees (paid by %s): %s nanoTON\n", indent, txAddr.String(), fees.String())
 	}
 
 	// Calculate balance change for this transaction
 	balanceChange := calculateBalanceChange(tx, originalSender)
 	if balanceChange.Cmp(big.NewInt(0)) != 0 {
 		tracker.totalChange.Add(tracker.totalChange, balanceChange)
-		fmt.Printf("%s  Balance Change for sender: %s nanoTON\n", indent, balanceChange.String())
+		logTrace("%s  Balance Change for sender: %s nanoTON\n", indent, balanceChange.String())
 	}
 
 	// Track this transaction
@@ -184,7 +194,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			return fmt.Errorf("failed to parse out messages: %w", err)
 		}
 
-		fmt.Printf("%s  Outgoing messages: %d\n", indent, len(outList))
+		logTrace("%s  Outgoing messages: %d\n", indent, len(outList))
 
 		for i, msg := range outList {
 			if msg.MsgType != tlb.MsgTypeInternal {
@@ -196,7 +206,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 				continue
 			}
 
-			fmt.Printf("%s    [%d] To: %s, Amount: %s nanoTON, CreatedLT: %d\n", indent, i, intMsg.DstAddr.String(), intMsg.Amount.String(), intMsg.CreatedLT)
+			logTrace("%s    [%d] To: %s, Amount: %s nanoTON, CreatedLT: %d\n", indent, i, intMsg.DstAddr.String(), intMsg.Amount.String(), intMsg.CreatedLT)
 
 			// Get destination account transactions
 			destAddr := intMsg.DstAddr
@@ -208,7 +218,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 				continue
 			}
 
-			fmt.Printf("%s      Scanned %d transactions...\n", indent, len(destTxs))
+			logTrace("%s      Scanned %d transactions...\n", indent, len(destTxs))
 
 			// Find the transaction that corresponds to this message
 			found := false
@@ -226,11 +236,11 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 
 					srcAddrMatch := false
 					if currentTxAddr != nil && inMsg.SrcAddr != nil {
-						srcAddrMatch = inMsg.SrcAddr.String() == currentTxAddr.String()
+						srcAddrMatch = inMsg.SrcAddr.Equals(currentTxAddr)
 					}
 
 					if createdLTMatch && srcAddrMatch {
-						fmt.Printf("%s      -> Matched by CreatedLT %d + SrcAddr (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
+						logTrace("%s      -> Matched by CreatedLT %d + SrcAddr (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
 						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
@@ -241,7 +251,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 						break
 					} else if createdLTMatch {
 						// Match by CreatedLT only (less strict)
-						fmt.Printf("%s      -> Matched by CreatedLT %d only (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
+						logTrace("%s      -> Matched by CreatedLT %d only (LT: %d)\n", indent, inMsg.CreatedLT, destTx.LT)
 
 						// Recursively trace this transaction
 						err = traceTransactionChain(ctx, api, destTx, originalSender, tracker, depth+1, scanDepth)
@@ -255,7 +265,7 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			}
 
 			if !found {
-				fmt.Printf("%s      Note: Could not find corresponding transaction\n", indent)
+				logTrace("%s      Note: Could not find corresponding transaction\n", indent)
 			}
 		}
 	}
@@ -283,7 +293,7 @@ func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr
 		return allTxs
 	}
 
-	fmt.Printf("%s      Paginating from LastLT: %d (target: %d txs)...\n", indent, account.LastTxLT, limit)
+	logTrace("%s      Paginating from LastLT: %d (target: %d txs)...\n", indent, account.LastTxLT, limit)
 
 	// Paginate through transactions
 	currentLT := account.LastTxLT
@@ -319,7 +329,7 @@ func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr
 		}
 	}
 
-	fmt.Printf("%s      Collected %d transactions total\n", indent, len(allTxs))
+	logTrace("%s      Collected %d transactions total\n", indent, len(allTxs))
 	return allTxs
 }
 
@@ -335,7 +345,8 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 	targetAddrStr := targetAddr.String()
 
 	// Check if this transaction is ON the target account
-	isTargetAccount := txAddr.String() == targetAddrStr
+	// Use Equals() to handle bounceable/non-bounceable forms
+	isTargetAccount := txAddr.Equals(targetAddr)
 
 	if isTargetAccount {
 		// This transaction happened on the target's account
@@ -379,7 +390,7 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 				for _, msg := range outList {
 					if msg.MsgType == tlb.MsgTypeInternal {
 						intMsg := msg.AsInternal()
-						if intMsg.DstAddr != nil && intMsg.DstAddr.String() == targetAddrStr {
+						if intMsg.DstAddr != nil && intMsg.DstAddr.Equals(targetAddr) {
 							// Target is receiving money (positive)
 							change.Add(change, intMsg.Amount.Nano())
 						}
@@ -391,7 +402,7 @@ func calculateBalanceChange(tx *tlb.Transaction, targetAddr *address.Address) *b
 		// Check if target sent this transaction (source of incoming message)
 		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
 			inMsg := tx.IO.In.AsInternal()
-			if inMsg.SrcAddr != nil && inMsg.SrcAddr.String() == targetAddrStr {
+			if inMsg.SrcAddr != nil && inMsg.SrcAddr.Equals(targetAddr) {
 				// This transaction was triggered by target's outgoing message
 				// (already counted in target's transaction, so don't double count)
 			}
