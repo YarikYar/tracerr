@@ -174,8 +174,13 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 		inMsg := tx.IO.In.AsInternal()
 		jettonTransfer, err := jetton.ParseJettonTransfer(inMsg)
 		if err == nil && jettonTransfer != nil && txAddr != nil {
-			// This account received a jetton transfer
-			tracker.trackJettonTransfer(ctx, api, txAddr.String(), txAddr.String(), jettonTransfer.Amount, true)
+			// For jetton transfers, the SOURCE of the message is the jetton wallet
+			// OpTransferNotification (0x7362d09c) means this account received jettons
+			// The source is the account's jetton wallet
+			if jettonTransfer.Opcode == jetton.OpTransferNotification && inMsg.SrcAddr != nil {
+				jettonWallet := inMsg.SrcAddr.String()
+				tracker.trackJettonTransfer(ctx, api, txAddr.String(), jettonWallet, jettonTransfer.Amount, true)
+			}
 		}
 	}
 
@@ -234,8 +239,12 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			// Parse jetton transfers from outgoing messages
 			jettonTransfer, err := jetton.ParseJettonTransfer(intMsg)
 			if err == nil && jettonTransfer != nil && txAddr != nil {
-				// This account sent a jetton transfer
-				tracker.trackJettonTransfer(ctx, api, txAddr.String(), txAddr.String(), jettonTransfer.Amount, false)
+				// For outgoing jetton transfers, the DESTINATION is the account's jetton wallet
+				// OpTransfer (0x0f8a7ea5) means this account is sending jettons via their wallet
+				if jettonTransfer.Opcode == jetton.OpTransfer && intMsg.DstAddr != nil {
+					jettonWallet := intMsg.DstAddr.String()
+					tracker.trackJettonTransfer(ctx, api, txAddr.String(), jettonWallet, jettonTransfer.Amount, false)
+				}
 			}
 
 			destAddr := intMsg.DstAddr

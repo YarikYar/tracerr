@@ -22,7 +22,7 @@ import (
 // @license.name MIT
 // @license.url https://opensource.org/licenses/MIT
 
-// @host localhost:8080
+// @host desktop.lan:8080
 // @BasePath /
 func main() {
 	port := flag.String("port", "8080", "Server port")
