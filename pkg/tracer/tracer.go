@@ -7,11 +7,15 @@ import (
 	"log"
 	"math/big"
 	"strings"
+	"sync"
+
+	"ton-tracer/pkg/jetton"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/dns"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type TransactionInfo struct {
@@ -22,15 +26,26 @@ type TransactionInfo struct {
 }
 
 type AccountStats struct {
-	Address       string
-	BalanceChange *big.Int
-	Fees          *big.Int
+	Address        string
+	BalanceChange  *big.Int
+	Fees           *big.Int
+	JettonBalances map[string]*JettonBalance // jetton_wallet_address -> balance
+}
+
+type JettonBalance struct {
+	JettonWallet string
+	JettonMaster string
+	Amount       *big.Int
+	Symbol       string
+	Decimals     int
 }
 
 type BalanceTracker struct {
-	Transactions  []*TransactionInfo
-	AccountStats  map[string]*AccountStats
-	OriginalAddr  string
+	Transactions    []*TransactionInfo
+	AccountStats    map[string]*AccountStats
+	OriginalAddr    string
+	JettonMetaCache map[string]*jetton.JettonMetadata // jetton_master -> metadata
+	metaMutex       sync.RWMutex
 }
 
 type Config struct {
@@ -67,8 +82,9 @@ func ResolveAddress(ctx context.Context, api ton.APIClientWrapped, addrStr strin
 // TraceTransaction traces a transaction chain and returns all account statistics
 func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, config Config) (*BalanceTracker, error) {
 	tracker := &BalanceTracker{
-		Transactions: make([]*TransactionInfo, 0),
-		AccountStats: make(map[string]*AccountStats),
+		Transactions:    make([]*TransactionInfo, 0),
+		AccountStats:    make(map[string]*AccountStats),
+		JettonMetaCache: make(map[string]*jetton.JettonMetadata),
 	}
 
 	if len(tx.AccountAddr) > 0 {
@@ -79,6 +95,46 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 	err := traceTransactionChain(ctx, api, tx, tracker, 0, config)
 	if err != nil {
 		return nil, err
+	}
+
+	// Post-process jetton balances to fetch metadata
+	for _, stats := range tracker.AccountStats {
+		for jettonWallet, jettonBalance := range stats.JettonBalances {
+			// Try to get jetton master by calling get_wallet_data on the jetton wallet
+			walletAddr, err := address.ParseAddr(jettonWallet)
+			if err != nil {
+				continue
+			}
+
+			master, err := api.CurrentMasterchainInfo(ctx)
+			if err != nil {
+				continue
+			}
+
+			// Call get_wallet_data() to get balance, owner, jetton master, and wallet code
+			res, err := api.RunGetMethod(ctx, master, walletAddr, "get_wallet_data")
+			if err != nil {
+				continue
+			}
+
+			if len(res.AsTuple()) >= 3 {
+				// get_wallet_data returns: balance, owner, jetton_master, jetton_wallet_code
+				jettonMasterSlice, ok := res.AsTuple()[2].(*cell.Slice)
+				if ok {
+					jettonMasterAddr, err := jettonMasterSlice.LoadAddr()
+					if err == nil {
+						jettonBalance.JettonMaster = jettonMasterAddr.String()
+
+						// Fetch metadata
+						meta := tracker.getJettonMetadata(ctx, api, jettonMasterAddr.String())
+						if meta != nil {
+							jettonBalance.Symbol = meta.Symbol
+							jettonBalance.Decimals = meta.Decimals
+						}
+					}
+				}
+			}
+		}
 	}
 
 	return tracker, nil
@@ -113,15 +169,26 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 	// Calculate balance change
 	balanceChange := calculateBalanceChange(tx)
 
+	// Parse jetton transfers from incoming message
+	if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+		inMsg := tx.IO.In.AsInternal()
+		jettonTransfer, err := jetton.ParseJettonTransfer(inMsg)
+		if err == nil && jettonTransfer != nil && txAddr != nil {
+			// This account received a jetton transfer
+			tracker.trackJettonTransfer(ctx, api, txAddr.String(), txAddr.String(), jettonTransfer.Amount, true)
+		}
+	}
+
 	// Track stats for this account
 	if txAddr != nil {
 		addrStr := txAddr.String()
 		stats, exists := tracker.AccountStats[addrStr]
 		if !exists {
 			stats = &AccountStats{
-				Address:       addrStr,
-				BalanceChange: big.NewInt(0),
-				Fees:          big.NewInt(0),
+				Address:        addrStr,
+				BalanceChange:  big.NewInt(0),
+				Fees:           big.NewInt(0),
+				JettonBalances: make(map[string]*JettonBalance),
 			}
 			tracker.AccountStats[addrStr] = stats
 		}
@@ -162,6 +229,13 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			intMsg := msg.AsInternal()
 			if intMsg.DstAddr == nil {
 				continue
+			}
+
+			// Parse jetton transfers from outgoing messages
+			jettonTransfer, err := jetton.ParseJettonTransfer(intMsg)
+			if err == nil && jettonTransfer != nil && txAddr != nil {
+				// This account sent a jetton transfer
+				tracker.trackJettonTransfer(ctx, api, txAddr.String(), txAddr.String(), jettonTransfer.Amount, false)
 			}
 
 			destAddr := intMsg.DstAddr
@@ -254,6 +328,66 @@ func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr
 	}
 
 	return allTxs
+}
+
+// getJettonMetadata fetches or retrieves cached jetton metadata
+func (tracker *BalanceTracker) getJettonMetadata(ctx context.Context, api ton.APIClientWrapped, jettonMaster string) *jetton.JettonMetadata {
+	tracker.metaMutex.RLock()
+	meta, exists := tracker.JettonMetaCache[jettonMaster]
+	tracker.metaMutex.RUnlock()
+
+	if exists {
+		return meta
+	}
+
+	// Fetch metadata
+	masterAddr, err := address.ParseAddr(jettonMaster)
+	if err != nil {
+		log.Printf("Warning: Failed to parse jetton master address %s: %v", jettonMaster, err)
+		return nil
+	}
+
+	meta, err = jetton.GetJettonMetadata(ctx, api, masterAddr)
+	if err != nil {
+		log.Printf("Warning: Failed to fetch jetton metadata for %s: %v", jettonMaster, err)
+		return nil
+	}
+
+	tracker.metaMutex.Lock()
+	tracker.JettonMetaCache[jettonMaster] = meta
+	tracker.metaMutex.Unlock()
+
+	return meta
+}
+
+// trackJettonTransfer tracks a jetton transfer for an account
+func (tracker *BalanceTracker) trackJettonTransfer(ctx context.Context, api ton.APIClientWrapped, accountAddr string, jettonWallet string, amount *big.Int, isIncoming bool) {
+	stats, exists := tracker.AccountStats[accountAddr]
+	if !exists {
+		stats = &AccountStats{
+			Address:        accountAddr,
+			BalanceChange:  big.NewInt(0),
+			Fees:           big.NewInt(0),
+			JettonBalances: make(map[string]*JettonBalance),
+		}
+		tracker.AccountStats[accountAddr] = stats
+	}
+
+	jettonBalance, exists := stats.JettonBalances[jettonWallet]
+	if !exists {
+		jettonBalance = &JettonBalance{
+			JettonWallet: jettonWallet,
+			Amount:       big.NewInt(0),
+		}
+		stats.JettonBalances[jettonWallet] = jettonBalance
+	}
+
+	// Add or subtract based on direction
+	if isIncoming {
+		jettonBalance.Amount.Add(jettonBalance.Amount, amount)
+	} else {
+		jettonBalance.Amount.Sub(jettonBalance.Amount, amount)
+	}
 }
 
 func calculateBalanceChange(tx *tlb.Transaction) *big.Int {

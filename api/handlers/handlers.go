@@ -187,10 +187,38 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		feesTon := new(big.Float).SetInt(stats.Fees)
 		feesTon.Quo(feesTon, big.NewFloat(1e9))
 
+		// Process jetton balances
+		jettons := make([]models.JettonBalanceInfo, 0, len(stats.JettonBalances))
+		for _, jettonBalance := range stats.JettonBalances {
+			if jettonBalance.Amount.Cmp(big.NewInt(0)) == 0 {
+				continue // Skip zero balances
+			}
+
+			// Format jetton amount with correct decimals
+			decimals := jettonBalance.Decimals
+			if decimals == 0 {
+				decimals = 9 // Default
+			}
+
+			divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+			quotient := new(big.Float).SetInt(jettonBalance.Amount)
+			divisorFloat := new(big.Float).SetInt(divisor)
+			result := new(big.Float).Quo(quotient, divisorFloat)
+
+			jettons = append(jettons, models.JettonBalanceInfo{
+				JettonWallet:  jettonBalance.JettonWallet,
+				JettonMaster:  jettonBalance.JettonMaster,
+				Symbol:        jettonBalance.Symbol,
+				Decimals:      jettonBalance.Decimals,
+				BalanceChange: result.Text('f', decimals),
+			})
+		}
+
 		accounts = append(accounts, models.AccountInfo{
 			Address:       stats.Address,
 			BalanceChange: balanceTon.Text('f', 9),
 			NetworkFees:   feesTon.Text('f', 9),
+			Jettons:       jettons,
 		})
 	}
 

@@ -8,11 +8,21 @@ type TraceRequest struct {
 	ScanDepth int    `json:"scan_depth,omitempty" example:"1000"`
 }
 
+// JettonBalanceInfo represents a jetton balance change for an account
+type JettonBalanceInfo struct {
+	JettonWallet  string `json:"jetton_wallet" example:"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"`
+	JettonMaster  string `json:"jetton_master" example:"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"`
+	Symbol        string `json:"symbol" example:"USDT"`
+	Decimals      int    `json:"decimals" example:"6"`
+	BalanceChange string `json:"balance_change" example:"100.000000"`
+}
+
 // AccountInfo represents statistics for a single account
 type AccountInfo struct {
-	Address       string `json:"address" example:"EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf"`
-	BalanceChange string `json:"balance_change_ton" example:"-0.115324419"`
-	NetworkFees   string `json:"network_fees_ton" example:"0.005692355"`
+	Address       string              `json:"address" example:"EQACkbxaojFxCOihpgl-Xh5yJdnR1lgBN-QnRz9xrZVEpZdf"`
+	BalanceChange string              `json:"balance_change_ton" example:"-0.115324419"`
+	NetworkFees   string              `json:"network_fees_ton" example:"0.005692355"`
+	Jettons       []JettonBalanceInfo `json:"jettons,omitempty"`
 }
 
 // TraceResponse represents the response from a trace operation

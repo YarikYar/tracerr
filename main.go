@@ -22,10 +22,19 @@ type TransactionInfo struct {
 	Amount  *big.Int
 }
 
+type JettonBalance struct {
+	JettonWallet string
+	JettonMaster string
+	Amount       *big.Int
+	Symbol       string
+	Decimals     int
+}
+
 type AccountStats struct {
-	Address       string
-	BalanceChange *big.Int
-	Fees          *big.Int
+	Address        string
+	BalanceChange  *big.Int
+	Fees           *big.Int
+	JettonBalances map[string]*JettonBalance
 }
 
 type BalanceTracker struct {
@@ -187,9 +196,10 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 		stats, exists := tracker.accountStats[addrStr]
 		if !exists {
 			stats = &AccountStats{
-				Address:       addrStr,
-				BalanceChange: big.NewInt(0),
-				Fees:          big.NewInt(0),
+				Address:        addrStr,
+				BalanceChange:  big.NewInt(0),
+				Fees:           big.NewInt(0),
+				JettonBalances: make(map[string]*JettonBalance),
 			}
 			tracker.accountStats[addrStr] = stats
 		}
@@ -450,6 +460,34 @@ func printResults(tracker *BalanceTracker) {
 		fmt.Printf("\nAccount: %s%s\n", addr, marker)
 		fmt.Printf("  Balance Change: %s TON\n", balanceTon.Text('f', 9))
 		fmt.Printf("  Network Fees:   %s TON\n", feesTon.Text('f', 9))
+
+		// Display jetton balances if any
+		if len(stats.JettonBalances) > 0 {
+			fmt.Printf("  Jetton Changes:\n")
+			for _, jettonBalance := range stats.JettonBalances {
+				if jettonBalance.Amount.Cmp(big.NewInt(0)) == 0 {
+					continue // Skip zero balances
+				}
+
+				// Format jetton amount with correct decimals
+				decimals := jettonBalance.Decimals
+				if decimals == 0 {
+					decimals = 9 // Default
+				}
+
+				divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+				quotient := new(big.Float).SetInt(jettonBalance.Amount)
+				divisorFloat := new(big.Float).SetInt(divisor)
+				result := new(big.Float).Quo(quotient, divisorFloat)
+
+				symbol := jettonBalance.Symbol
+				if symbol == "" {
+					symbol = "UNKNOWN"
+				}
+
+				fmt.Printf("    - %s: %s (%s)\n", symbol, result.Text('f', decimals), jettonBalance.JettonMaster)
+			}
+		}
 	}
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
