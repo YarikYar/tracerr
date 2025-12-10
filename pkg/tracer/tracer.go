@@ -40,6 +40,18 @@ type JettonBalance struct {
 	Decimals     int
 }
 
+// Known pTON (Proxy TON) addresses - these represent wrapped TON and should be filtered
+// as their balance is already reflected in TON balance changes
+var pTONMasters = map[string]bool{
+	"EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsBc_DhVfRRtOEffLez": true, // pTON v1 (STON.fi)
+	"EQBnGWMCf3-FZZq1W4IWcWiGAc3PHuZ0_H-7sad2oY00o83S": true, // pTON v2 (STON.fi)
+}
+
+// IsPTON checks if the given jetton master is a pTON (Proxy TON) contract
+func IsPTON(jettonMaster string) bool {
+	return pTONMasters[jettonMaster]
+}
+
 type BalanceTracker struct {
 	Transactions    []*TransactionInfo
 	AccountStats    map[string]*AccountStats
@@ -150,6 +162,35 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 		txAddr = address.NewAddress(0, 0, tx.AccountAddr)
 	}
 
+	if config.Verbose {
+		txHash := ""
+		if len(tx.Hash) > 0 {
+			txHash = hex.EncodeToString(tx.Hash)
+		}
+		addrStr := ""
+		if txAddr != nil {
+			addrStr = txAddr.String()
+		}
+		log.Printf("[TRACE depth=%d] TX %s on account %s, LT=%d", depth, txHash[:16], addrStr, tx.LT)
+
+		// Log incoming message details
+		if tx.IO.In != nil && tx.IO.In.MsgType == tlb.MsgTypeInternal {
+			inMsg := tx.IO.In.AsInternal()
+			log.Printf("  IN: from=%s amount=%s", inMsg.SrcAddr, inMsg.Amount.String())
+		}
+
+		// Log outgoing messages
+		if tx.IO.Out != nil {
+			outList, _ := tx.IO.Out.ToSlice()
+			for i, msg := range outList {
+				if msg.MsgType == tlb.MsgTypeInternal {
+					intMsg := msg.AsInternal()
+					log.Printf("  OUT[%d]: to=%s amount=%s", i, intMsg.DstAddr, intMsg.Amount.String())
+				}
+			}
+		}
+	}
+
 	// Calculate total fees (transaction fees + forward fees)
 	totalFees := new(big.Int).Set(tx.TotalFees.Coins.Nano())
 
@@ -174,12 +215,36 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 		inMsg := tx.IO.In.AsInternal()
 		jettonTransfer, err := jetton.ParseJettonTransfer(inMsg)
 		if err == nil && jettonTransfer != nil && txAddr != nil {
+			if config.Verbose {
+				log.Printf("[JETTON IN] opcode=0x%08x amount=%s dest=%v",
+					jettonTransfer.Opcode, jettonTransfer.Amount.String(), jettonTransfer.Destination)
+			}
 			// For jetton transfers, the SOURCE of the message is the jetton wallet
 			// OpTransferNotification (0x7362d09c) means this account received jettons
 			// The source is the account's jetton wallet
 			if jettonTransfer.Opcode == jetton.OpTransferNotification && inMsg.SrcAddr != nil {
 				jettonWallet := inMsg.SrcAddr.String()
+				if config.Verbose {
+					log.Printf("[JETTON] TransferNotification: account=%s wallet=%s amount=%s (incoming)",
+						txAddr.String(), jettonWallet, jettonTransfer.Amount.String())
+				}
 				tracker.trackJettonTransfer(ctx, api, txAddr.String(), jettonWallet, jettonTransfer.Amount, true)
+			}
+
+			// OpInternalTransfer (0x178d4519) means this jetton wallet received jettons
+			// We need to find the owner of this wallet and credit them
+			if jettonTransfer.Opcode == jetton.OpInternalTransfer && txAddr != nil {
+				// txAddr is the jetton wallet that received the transfer
+				// Get owner by calling get_wallet_data
+				owner := getJettonWalletOwner(ctx, api, txAddr)
+				if owner != nil {
+					jettonWallet := txAddr.String()
+					if config.Verbose {
+						log.Printf("[JETTON] InternalTransfer: wallet=%s owner=%s amount=%s (incoming)",
+							jettonWallet, owner.String(), jettonTransfer.Amount.String())
+					}
+					tracker.trackJettonTransfer(ctx, api, owner.String(), jettonWallet, jettonTransfer.Amount, true)
+				}
 			}
 		}
 	}
@@ -239,10 +304,18 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			// Parse jetton transfers from outgoing messages
 			jettonTransfer, err := jetton.ParseJettonTransfer(intMsg)
 			if err == nil && jettonTransfer != nil && txAddr != nil {
+				if config.Verbose {
+					log.Printf("[JETTON OUT] opcode=0x%08x amount=%s dest=%v to=%s",
+						jettonTransfer.Opcode, jettonTransfer.Amount.String(), jettonTransfer.Destination, intMsg.DstAddr.String())
+				}
 				// For outgoing jetton transfers, the DESTINATION is the account's jetton wallet
 				// OpTransfer (0x0f8a7ea5) means this account is sending jettons via their wallet
 				if jettonTransfer.Opcode == jetton.OpTransfer && intMsg.DstAddr != nil {
 					jettonWallet := intMsg.DstAddr.String()
+					if config.Verbose {
+						log.Printf("[JETTON] Transfer: account=%s wallet=%s amount=%s (outgoing)",
+							txAddr.String(), jettonWallet, jettonTransfer.Amount.String())
+					}
 					tracker.trackJettonTransfer(ctx, api, txAddr.String(), jettonWallet, jettonTransfer.Amount, false)
 				}
 			}
@@ -397,6 +470,38 @@ func (tracker *BalanceTracker) trackJettonTransfer(ctx context.Context, api ton.
 	} else {
 		jettonBalance.Amount.Sub(jettonBalance.Amount, amount)
 	}
+}
+
+// getJettonWalletOwner returns the owner address of a jetton wallet
+func getJettonWalletOwner(ctx context.Context, api ton.APIClientWrapped, walletAddr *address.Address) *address.Address {
+	master, err := api.CurrentMasterchainInfo(ctx)
+	if err != nil {
+		return nil
+	}
+
+	// Call get_wallet_data() to get balance, owner, jetton_master, wallet_code
+	res, err := api.RunGetMethod(ctx, master, walletAddr, "get_wallet_data")
+	if err != nil {
+		return nil
+	}
+
+	tuple := res.AsTuple()
+	if len(tuple) < 2 {
+		return nil
+	}
+
+	// get_wallet_data returns: balance, owner, jetton_master, jetton_wallet_code
+	ownerSlice, ok := tuple[1].(*cell.Slice)
+	if !ok {
+		return nil
+	}
+
+	ownerAddr, err := ownerSlice.LoadAddr()
+	if err != nil {
+		return nil
+	}
+
+	return ownerAddr
 }
 
 func calculateBalanceChange(tx *tlb.Transaction) *big.Int {

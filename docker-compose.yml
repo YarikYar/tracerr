@@ -1,15 +1,14 @@
-version: '3.8'
-
 services:
   ton-tracer-api:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - API_HOST=${API_HOST:-tracer.zaruchevskiy.ru}
     container_name: ton-tracer-api
-    ports:
-      - "8080:8080"
     environment:
       - GIN_MODE=release
+      - API_HOST=${API_HOST:-tracer.zaruchevskiy.ru}
     command: ["-port", "8080"]
     restart: unless-stopped
     healthcheck:
@@ -18,17 +17,27 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - traefik_default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ton-tracer.rule=Host(`${API_HOST:-tracer.zaruchevskiy.ru}`)"
+      - "traefik.http.routers.ton-tracer.entrypoints=websecure"
+      - "traefik.http.routers.ton-tracer.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ton-tracer.loadbalancer.server.port=8080"
+      - "traefik.docker.network=traefik_default"
 
   # Optional: Testnet version
   ton-tracer-api-testnet:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - API_HOST=${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}
     container_name: ton-tracer-api-testnet
-    ports:
-      - "8081:8080"
     environment:
       - GIN_MODE=release
+      - API_HOST=${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}
     command: ["-port", "8080", "-testnet"]
     restart: unless-stopped
     profiles: ["testnet"]  # Only starts when specified
@@ -38,3 +47,16 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - traefik_default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ton-tracer-testnet.rule=Host(`${API_HOST_TESTNET:-testnet-tracer.zaruchevskiy.ru}`)"
+      - "traefik.http.routers.ton-tracer-testnet.entrypoints=websecure"
+      - "traefik.http.routers.ton-tracer-testnet.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ton-tracer-testnet.loadbalancer.server.port=8080"
+      - "traefik.docker.network=traefik_default"
+
+networks:
+  traefik_default:
+    external: true

@@ -6,6 +6,7 @@ type TraceRequest struct {
 	Hash      string `json:"hash,omitempty" example:"0a1073ddaae99eed5a6de55cbd60aee18b1fc3deeee59414024679bf00172229"`
 	LT        uint64 `json:"lt,omitempty" example:"63633416000001"`
 	ScanDepth int    `json:"scan_depth,omitempty" example:"1000"`
+	Verbose   bool   `json:"verbose,omitempty" example:"false"`
 }
 
 // JettonBalanceInfo represents a jetton balance change for an account

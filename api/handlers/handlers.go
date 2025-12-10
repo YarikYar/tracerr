@@ -163,7 +163,7 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 	config := tracer.Config{
 		ScanDepth: scanDepth,
 		Testnet:   false,
-		Verbose:   false,
+		Verbose:   req.Verbose,
 	}
 
 	tracker, err := tracer.TraceTransaction(ctx, h.api, initialTx, config)
@@ -192,6 +192,11 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		for _, jettonBalance := range stats.JettonBalances {
 			if jettonBalance.Amount.Cmp(big.NewInt(0)) == 0 {
 				continue // Skip zero balances
+			}
+
+			// Skip pTON (Proxy TON) - it's wrapped TON already reflected in balance_change_ton
+			if tracer.IsPTON(jettonBalance.JettonMaster) {
+				continue
 			}
 
 			// Format jetton amount with correct decimals
