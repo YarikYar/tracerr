@@ -104,9 +104,57 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 		tracker.OriginalAddr = txAddr.String()
 	}
 
+	// Store the initial transaction LT for reference
+	initialLT := tx.LT
+
 	err := traceTransactionChain(ctx, api, tx, tracker, 0, config)
 	if err != nil {
 		return nil, err
+	}
+
+	// Scan for subsequent incoming transactions on the original address
+	// This catches returns from DEX swaps (refunds, change, jetton transfers, etc.)
+	if tracker.OriginalAddr != "" {
+		origAddr, err := address.ParseAddr(tracker.OriginalAddr)
+		if err == nil {
+			// Track processed LTs to avoid duplicates
+			processedLTs := make(map[uint64]bool)
+			processedLTs[initialLT] = true
+
+			// Scan recent transactions on original address
+			origTxs := scanAccountTransactions(ctx, api, origAddr, config.ScanDepth)
+			for _, origTx := range origTxs {
+				// Skip already processed transactions
+				if processedLTs[origTx.LT] {
+					continue
+				}
+				// Skip transactions before the initial one
+				if origTx.LT <= initialLT {
+					continue
+				}
+				// Stop after a reasonable time window (LT difference > 100000 means different block group)
+				if origTx.LT > initialLT+100000 {
+					break
+				}
+
+				// Process any incoming transaction after our initial TX
+				// This catches DEX returns, refunds, jetton notifications, etc.
+				if origTx.IO.In != nil && origTx.IO.In.MsgType == tlb.MsgTypeInternal {
+					inMsg := origTx.IO.In.AsInternal()
+					if config.Verbose {
+						srcStr := ""
+						if inMsg.SrcAddr != nil {
+							srcStr = inMsg.SrcAddr.String()
+						}
+						log.Printf("[TRACE RETURN] Found subsequent tx from %s to %s, amount=%s, LT=%d",
+							srcStr, tracker.OriginalAddr, inMsg.Amount.String(), origTx.LT)
+					}
+					processedLTs[origTx.LT] = true
+					// Process this transaction for balance changes (don't recurse deep)
+					traceTransactionChain(ctx, api, origTx, tracker, 49, config)
+				}
+			}
+		}
 	}
 
 	// Post-process jetton balances to fetch metadata

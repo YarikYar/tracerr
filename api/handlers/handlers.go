@@ -111,6 +111,76 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		}
 
 		initialTx = txs[0]
+	} else if req.Hash != "" {
+		// Hash provided but no LT - search for transaction by hash in recent transactions
+		txHashBytes, err := hex.DecodeString(req.Hash)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse{
+				Success: false,
+				Error:   "Invalid transaction hash: " + err.Error(),
+			})
+			return
+		}
+
+		master, err := h.api.CurrentMasterchainInfo(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+				Success: false,
+				Error:   "Failed to get master block: " + err.Error(),
+			})
+			return
+		}
+
+		account, err := h.api.GetAccount(ctx, master, addr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+				Success: false,
+				Error:   "Failed to get account: " + err.Error(),
+			})
+			return
+		}
+
+		if account == nil || !account.IsActive {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse{
+				Success: false,
+				Error:   "Account is not active",
+			})
+			return
+		}
+
+		// Search through recent transactions to find the one with matching hash
+		currentLT := account.LastTxLT
+		currentHash := account.LastTxHash
+		found := false
+
+		for i := 0; i < scanDepth && !found; i += 15 {
+			txs, err := h.api.ListTransactions(ctx, addr, 15, currentLT, currentHash)
+			if err != nil || len(txs) == 0 {
+				break
+			}
+
+			for _, tx := range txs {
+				if hex.EncodeToString(tx.Hash) == hex.EncodeToString(txHashBytes) {
+					initialTx = tx
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				lastTx := txs[len(txs)-1]
+				currentLT = lastTx.LT
+				currentHash = lastTx.Hash
+			}
+		}
+
+		if !found {
+			c.JSON(http.StatusNotFound, models.ErrorResponse{
+				Success: false,
+				Error:   "Transaction not found in recent history",
+			})
+			return
+		}
 	} else {
 		// Get latest transaction from account state
 		master, err := h.api.CurrentMasterchainInfo(ctx)
