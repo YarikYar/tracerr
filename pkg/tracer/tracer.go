@@ -133,7 +133,7 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 					continue
 				}
 				// Stop after a reasonable time window (LT difference > 100000 means different block group)
-				if origTx.LT > initialLT+100000 {
+				if origTx.LT > initialLT+500000 {
 					break
 				}
 
