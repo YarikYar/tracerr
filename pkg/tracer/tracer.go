@@ -132,8 +132,9 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 				if origTx.LT <= initialLT {
 					continue
 				}
-				// Stop after a reasonable time window (LT difference > 100000 means different block group)
-				if origTx.LT > initialLT+500000 {
+				// Stop after a reasonable time window (LT difference > 2000000 = ~200 seconds)
+				// StonFi jetton transfers can arrive significantly later than the swap tx
+				if origTx.LT > initialLT+2000000 {
 					break
 				}
 
@@ -311,6 +312,14 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			tracker.AccountStats[addrStr] = stats
 		}
 		stats.BalanceChange.Add(stats.BalanceChange, balanceChange)
+		// Only subtract fees for transactions with outgoing messages
+		// (fees for incoming-only transactions are paid by the sender)
+		if tx.IO.Out != nil {
+			outList, err := tx.IO.Out.ToSlice()
+			if err == nil && len(outList) > 0 {
+				stats.BalanceChange.Sub(stats.BalanceChange, totalFees)
+			}
+		}
 		stats.Fees.Add(stats.Fees, totalFees)
 	}
 
