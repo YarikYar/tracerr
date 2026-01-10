@@ -3,8 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/hex"
+	"log"
 	"math/big"
 	"net/http"
+	"time"
 
 	"ton-tracer/api/models"
 	"ton-tracer/pkg/tracer"
@@ -21,6 +23,7 @@ type Handler struct {
 }
 
 func NewHandler(testnet bool) (*Handler, error) {
+	log.Println("[INIT] Creating connection pool...")
 	client := liteclient.NewConnectionPool()
 
 	configURL := "https://ton.org/global.config.json"
@@ -29,13 +32,27 @@ func NewHandler(testnet bool) (*Handler, error) {
 	}
 
 	ctx := context.Background()
+	log.Printf("[INIT] Loading config from %s...", configURL)
+	startConfig := time.Now()
 	err := client.AddConnectionsFromConfigUrl(ctx, configURL)
+	log.Printf("[INIT] AddConnectionsFromConfigUrl took %v", time.Since(startConfig))
 	if err != nil {
 		return nil, err
 	}
 
+	log.Println("[INIT] Creating API client...")
 	api := ton.NewAPIClient(client, ton.ProofCheckPolicySecure).WithRetry()
 
+	// Warmup - make a test request to establish connections
+	log.Println("[INIT] Warming up connections...")
+	startWarmup := time.Now()
+	_, err = api.CurrentMasterchainInfo(ctx)
+	log.Printf("[INIT] Warmup took %v", time.Since(startWarmup))
+	if err != nil {
+		log.Printf("[INIT] Warmup failed: %v (continuing anyway)", err)
+	}
+
+	log.Println("[INIT] Handler ready")
 	return &Handler{
 		client: client,
 		api:    api,
@@ -54,6 +71,7 @@ func NewHandler(testnet bool) (*Handler, error) {
 // @Failure 500 {object} models.ErrorResponse
 // @Router /api/v1/trace [post]
 func (h *Handler) TraceTransaction(c *gin.Context) {
+	log.Println("[HANDLER] TraceTransaction called")
 	var req models.TraceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{
@@ -66,7 +84,10 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 	ctx := context.Background()
 
 	// Resolve address
+	log.Println("[HANDLER] Resolving address...")
+	startResolve := time.Now()
 	addr, err := tracer.ResolveAddress(ctx, h.api, req.Address)
+	log.Printf("[HANDLER] ResolveAddress took %v", time.Since(startResolve))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResponse{
 			Success: false,
@@ -84,6 +105,7 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 
 	// If hash and LT provided, fetch specific transaction
 	if req.Hash != "" && req.LT != 0 {
+		log.Printf("[HANDLER] Fetching tx by hash and LT: %s, %d", req.Hash, req.LT)
 		txHashBytes, err := hex.DecodeString(req.Hash)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.ErrorResponse{
@@ -93,7 +115,10 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 			return
 		}
 
+		log.Printf("[HANDLER] Calling ListTransactions...")
+		startList := time.Now()
 		txs, err := h.api.ListTransactions(ctx, addr, 1, req.LT, txHashBytes)
+		log.Printf("[HANDLER] ListTransactions took %v", time.Since(startList))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 				Success: false,
@@ -236,7 +261,10 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 		Verbose:   req.Verbose,
 	}
 
+	log.Printf("[HANDLER] Starting TraceTransaction, scanDepth=%d", scanDepth)
+	startTrace := time.Now()
 	tracker, err := tracer.TraceTransaction(ctx, h.api, initialTx, config)
+	log.Printf("[HANDLER] TraceTransaction took %v", time.Since(startTrace))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Success: false,

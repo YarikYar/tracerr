@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"time"
 
 	"ton-tracer/pkg/jetton"
 
@@ -93,6 +94,9 @@ func ResolveAddress(ctx context.Context, api ton.APIClientWrapped, addrStr strin
 
 // TraceTransaction traces a transaction chain and returns all account statistics
 func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Transaction, config Config) (*BalanceTracker, error) {
+	startTotal := time.Now()
+	log.Printf("[TIMING] TraceTransaction started")
+
 	tracker := &BalanceTracker{
 		Transactions:    make([]*TransactionInfo, 0),
 		AccountStats:    make(map[string]*AccountStats),
@@ -107,7 +111,9 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 	// Store the initial transaction LT for reference
 	initialLT := tx.LT
 
+	startChain := time.Now()
 	err := traceTransactionChain(ctx, api, tx, tracker, 0, config)
+	log.Printf("[TIMING] traceTransactionChain took %v", time.Since(startChain))
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +128,9 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 			processedLTs[initialLT] = true
 
 			// Scan recent transactions on original address
+			startScan := time.Now()
 			origTxs := scanAccountTransactions(ctx, api, origAddr, config.ScanDepth)
+			log.Printf("[TIMING] scanAccountTransactions(origAddr) took %v, got %d txs", time.Since(startScan), len(origTxs))
 			for _, origTx := range origTxs {
 				// Skip already processed transactions
 				if processedLTs[origTx.LT] {
@@ -159,8 +167,11 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 	}
 
 	// Post-process jetton balances to fetch metadata
+	startMeta := time.Now()
+	metaCount := 0
 	for _, stats := range tracker.AccountStats {
 		for jettonWallet, jettonBalance := range stats.JettonBalances {
+			metaCount++
 			// Try to get jetton master by calling get_wallet_data on the jetton wallet
 			walletAddr, err := address.ParseAddr(jettonWallet)
 			if err != nil {
@@ -197,6 +208,8 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 			}
 		}
 	}
+	log.Printf("[TIMING] jetton metadata processing took %v for %d wallets", time.Since(startMeta), metaCount)
+	log.Printf("[TIMING] TraceTransaction total took %v", time.Since(startTotal))
 
 	return tracker, nil
 }
@@ -378,8 +391,12 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			}
 
 			destAddr := intMsg.DstAddr
+			log.Printf("[TRACE depth=%d] processing outMsg to %s, createdLT=%d", depth, destAddr.String()[:16], intMsg.CreatedLT)
+			startDestScan := time.Now()
 			destTxs := scanAccountTransactions(ctx, api, destAddr, config.ScanDepth)
+			log.Printf("[TRACE depth=%d] scan %s took %v, got %d txs", depth, destAddr.String()[:16], time.Since(startDestScan), len(destTxs))
 			if len(destTxs) == 0 {
+				log.Printf("[TRACE depth=%d] no txs found for %s, skipping", depth, destAddr.String()[:16])
 				continue
 			}
 
@@ -388,7 +405,8 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 				currentTxAddr = address.NewAddress(0, 0, tx.AccountAddr)
 			}
 
-			for _, destTx := range destTxs {
+			foundMatch := false
+			for i, destTx := range destTxs {
 				if destTx.IO.In != nil && destTx.IO.In.MsgType == tlb.MsgTypeInternal {
 					inMsg := destTx.IO.In.AsInternal()
 
@@ -399,18 +417,37 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 					}
 
 					if createdLTMatch && srcAddrMatch {
+						log.Printf("[TRACE depth=%d] found match at idx %d, recursing to depth %d", depth, i, depth+1)
+						foundMatch = true
+						recurseStart := time.Now()
 						err = traceTransactionChain(ctx, api, destTx, tracker, depth+1, config)
+						log.Printf("[TRACE depth=%d] recurse took %v", depth, time.Since(recurseStart))
 						if err != nil {
 							return err
 						}
 						break
 					} else if createdLTMatch {
+						log.Printf("[TRACE depth=%d] found LT match at idx %d (no src match), recursing", depth, i)
+						foundMatch = true
+						recurseStart := time.Now()
 						err = traceTransactionChain(ctx, api, destTx, tracker, depth+1, config)
+						log.Printf("[TRACE depth=%d] recurse took %v", depth, time.Since(recurseStart))
 						if err != nil {
 							return err
 						}
 						break
 					}
+				}
+			}
+			if !foundMatch {
+				// Log more details for debugging
+				log.Printf("[TRACE depth=%d] no matching tx found for createdLT=%d in %d txs, dest=%s",
+					depth, intMsg.CreatedLT, len(destTxs), destAddr.String()[:20])
+				if len(destTxs) > 0 {
+					firstLT := destTxs[0].LT
+					lastLT := destTxs[len(destTxs)-1].LT
+					log.Printf("[TRACE depth=%d] scanned LT range: %d - %d, looking for createdLT=%d",
+						depth, lastLT, firstLT, intMsg.CreatedLT)
 				}
 			}
 		}
@@ -420,30 +457,48 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 }
 
 func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr *address.Address, limit int) []*tlb.Transaction {
+	scanStart := time.Now()
+	addrShort := addr.String()[:16]
+	log.Printf("[SCAN %s] start, limit=%d", addrShort, limit)
+
 	var allTxs []*tlb.Transaction
 
+	masterStart := time.Now()
 	master, err := api.CurrentMasterchainInfo(ctx)
+	log.Printf("[SCAN %s] CurrentMasterchainInfo took %v", addrShort, time.Since(masterStart))
 	if err != nil {
-		log.Printf("Warning: Failed to get master block: %v", err)
+		log.Printf("[SCAN %s] ERROR: Failed to get master block: %v", addrShort, err)
 		return allTxs
 	}
 
+	accountStart := time.Now()
 	account, err := api.GetAccount(ctx, master, addr)
+	log.Printf("[SCAN %s] GetAccount took %v", addrShort, time.Since(accountStart))
 	if err != nil || account == nil || !account.IsActive || account.LastTxLT == 0 {
+		log.Printf("[SCAN %s] account inactive or error, trying fallback", addrShort)
+		fallbackStart := time.Now()
 		txs, err := api.ListTransactions(ctx, addr, uint32(limit), 0, nil)
+		log.Printf("[SCAN %s] fallback ListTransactions took %v", addrShort, time.Since(fallbackStart))
 		if err == nil {
+			log.Printf("[SCAN %s] total took %v, got %d txs", addrShort, time.Since(scanStart), len(txs))
 			return txs
 		}
+		log.Printf("[SCAN %s] total took %v, got 0 txs", addrShort, time.Since(scanStart))
 		return allTxs
 	}
 
 	currentLT := account.LastTxLT
 	currentHash := account.LastTxHash
 	batchSize := uint32(15)
+	batchNum := 0
 
 	for len(allTxs) < limit {
+		batchNum++
+		batchStart := time.Now()
 		txs, err := api.ListTransactions(ctx, addr, batchSize, currentLT, currentHash)
+		log.Printf("[SCAN %s] batch %d: ListTransactions took %v, got %d txs", addrShort, batchNum, time.Since(batchStart), len(txs))
 		if err != nil {
+			log.Printf("[SCAN %s] batch %d error: %v", addrShort, batchNum, err)
 			break
 		}
 
@@ -466,6 +521,7 @@ func scanAccountTransactions(ctx context.Context, api ton.APIClientWrapped, addr
 		}
 	}
 
+	log.Printf("[SCAN %s] total took %v, got %d txs in %d batches", addrShort, time.Since(scanStart), len(allTxs), batchNum)
 	return allTxs
 }
 
