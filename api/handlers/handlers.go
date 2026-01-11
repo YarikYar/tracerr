@@ -276,10 +276,9 @@ func (h *Handler) TraceTransaction(c *gin.Context) {
 	// Build response
 	accounts := make([]models.AccountInfo, 0, len(tracker.AccountStats))
 	for _, stats := range tracker.AccountStats {
-		balanceWithFees := new(big.Int).Set(stats.BalanceChange)
-		balanceWithFees.Sub(balanceWithFees, stats.Fees)
-
-		balanceTon := new(big.Float).SetInt(balanceWithFees)
+		// Note: stats.BalanceChange already includes fee deductions from tracer.go
+		// Do NOT subtract fees again here
+		balanceTon := new(big.Float).SetInt(stats.BalanceChange)
 		balanceTon.Quo(balanceTon, big.NewFloat(1e9))
 
 		feesTon := new(big.Float).SetInt(stats.Fees)
