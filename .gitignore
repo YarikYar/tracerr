@@ -69,3 +69,4 @@ temp/
 # Docker
 *.pid
 .dockerignore.bak
+tracerr-api

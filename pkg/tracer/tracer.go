@@ -127,6 +127,11 @@ func TraceTransaction(ctx context.Context, api ton.APIClientWrapped, tx *tlb.Tra
 			processedLTs := make(map[uint64]bool)
 			processedLTs[initialLT] = true
 
+			// Add all LTs from recursive tracing to avoid double-processing
+			for _, txInfo := range tracker.Transactions {
+				processedLTs[txInfo.LT] = true
+			}
+
 			// Scan recent transactions on original address
 			startScan := time.Now()
 			origTxs := scanAccountTransactions(ctx, api, origAddr, config.ScanDepth)
