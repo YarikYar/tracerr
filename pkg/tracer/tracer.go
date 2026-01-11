@@ -330,14 +330,8 @@ func traceTransactionChain(ctx context.Context, api ton.APIClientWrapped, tx *tl
 			tracker.AccountStats[addrStr] = stats
 		}
 		stats.BalanceChange.Add(stats.BalanceChange, balanceChange)
-		// Only subtract fees for transactions with outgoing messages
-		// (fees for incoming-only transactions are paid by the sender)
-		if tx.IO.Out != nil {
-			outList, err := tx.IO.Out.ToSlice()
-			if err == nil && len(outList) > 0 {
-				stats.BalanceChange.Sub(stats.BalanceChange, totalFees)
-			}
-		}
+		// Always subtract fees - both outgoing and incoming tx fees are paid by the account
+		stats.BalanceChange.Sub(stats.BalanceChange, totalFees)
 		stats.Fees.Add(stats.Fees, totalFees)
 	}
 
